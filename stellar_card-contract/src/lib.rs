@@ -10,8 +10,10 @@
 //! so off-chain systems can reconcile card top-ups.
 //!
 //! ## Security features
-//! * **Reentrancy guard** — a storage-backed guard (`_enter` / `_exit`) blocks
-//!   reentrant calls into the payment functions.
+//! * **Reentrancy guard** — a storage-backed guard (`_enter` / `_exit`, wrapped
+//!   by `with_reentrancy_guard`) surrounds every external token call —
+//!   `pay_usdc`, `pay_xlm` and `rescue_tokens` — so a token contract calling
+//!   back into any of them is blocked.
 //! * **Pause mechanism** — the admin can pause the contract to halt all transfers
 //!   during incidents or upgrades.
 //! * **Role-based access control (RBAC)** — a hierarchical role model
@@ -326,6 +328,26 @@ impl Stellar_CardReceiver {
             .set(&DataKey::ReentrancyGuard, &false);
     }
 
+    /// Runs `f` while holding the reentrancy guard (Issue #397 - Part 2).
+    ///
+    /// Every external call into a token contract goes through this helper,
+    /// so acquiring and releasing the guard lives in exactly one place
+    /// instead of being repeated (and potentially forgotten) on every early
+    /// return inside each entrypoint. `f` returns normally on both its
+    /// success and error paths, and the guard is released before its result
+    /// is handed back. If `f` panics, the whole invocation is rolled back by
+    /// the host, which also discards the guard write, so there is no path
+    /// that leaves the guard stuck on.
+    ///
+    /// # Panics
+    /// Panics with "reentrancy detected" if the guard is already held.
+    fn with_reentrancy_guard<T>(env: &Env, f: impl FnOnce() -> T) -> T {
+        Self::_enter(env);
+        let result = f();
+        Self::_exit(env);
+        result
+    }
+
     /// Returns whether the contract is currently paused.
     fn is_paused(env: &Env) -> bool {
         env.storage()
@@ -468,16 +490,16 @@ impl Stellar_CardReceiver {
             .get(&DataKey::UsdcContract)
             .unwrap();
 
-        Self::_enter(&env);
-
-        let token_client = token::Client::new(&env, &usdc_contract);
-        let res = token_client.try_transfer(&from, &treasury, &amount);
-        if res.is_err() {
-            Self::_exit(&env);
+        // The token contract is the only external call in this function, so
+        // it is the only step that needs to run under the guard.
+        let transferred = Self::with_reentrancy_guard(&env, || {
+            token::Client::new(&env, &usdc_contract)
+                .try_transfer(&from, &treasury, &amount)
+                .is_ok()
+        });
+        if !transferred {
             return Err(Error::TransferFailed);
         }
-
-        Self::_exit(&env);
 
         env.events()
             .publish((Symbol::new(&env, "pay_usdc"), order_id, from), amount);
@@ -516,16 +538,16 @@ impl Stellar_CardReceiver {
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
         let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
 
-        Self::_enter(&env);
-
-        let token_client = token::Client::new(&env, &xlm_contract);
-        let res = token_client.try_transfer(&from, &treasury, &amount);
-        if res.is_err() {
-            Self::_exit(&env);
+        // The token contract is the only external call in this function, so
+        // it is the only step that needs to run under the guard.
+        let transferred = Self::with_reentrancy_guard(&env, || {
+            token::Client::new(&env, &xlm_contract)
+                .try_transfer(&from, &treasury, &amount)
+                .is_ok()
+        });
+        if !transferred {
             return Err(Error::TransferFailed);
         }
-
-        Self::_exit(&env);
 
         env.events()
             .publish((Symbol::new(&env, "pay_xlm"), order_id, from), amount);
@@ -665,9 +687,16 @@ impl Stellar_CardReceiver {
     /// * `TransferFailed` - If the underlying token transfer fails (e.g. the
     ///   contract's balance is lower than `amount`)
     ///
+    /// # Security (Issue #397 - Part 2)
+    /// The transfer runs under the reentrancy guard, and the daily
+    /// accumulator is written before the transfer (Checks-Effects-
+    /// Interactions), because `token_contract` is caller-supplied and may
+    /// call back into this contract.
+    ///
     /// # Panics
-    /// Panics if `caller` does not hold the `Admin` role, or if
-    /// `caller.require_auth()` fails.
+    /// Panics if `caller` does not hold the `Admin` role, if
+    /// `caller.require_auth()` fails, or with "reentrancy detected" if
+    /// invoked while another guarded operation is in progress.
     pub fn rescue_tokens(
         env: Env,
         caller: Address,
@@ -715,16 +744,28 @@ impl Stellar_CardReceiver {
             }
         }
 
+        // Checks-Effects-Interactions (Issue #397 - Part 2): `token_contract`
+        // is caller-supplied and may be any contract, not just a trusted SAC,
+        // which makes this the contract's only call into potentially
+        // untrusted code. Record the withdrawal against today's accumulator
+        // *before* the transfer, so a callback made from inside the
+        // transfer can never observe a stale total and slip a second
+        // withdrawal under the daily limit.
+        env.storage().instance().set(&day_key, &new_total);
+
         let contract_address = env.current_contract_address();
-        let token_client = token::Client::new(&env, &token_contract);
-        let res = token_client.try_transfer(&contract_address, &to, &amount);
-        if res.is_err() {
+        let transferred = Self::with_reentrancy_guard(&env, || {
+            token::Client::new(&env, &token_contract)
+                .try_transfer(&contract_address, &to, &amount)
+                .is_ok()
+        });
+        if !transferred {
+            // The transfer didn't happen, so it mustn't count against the
+            // day's budget: restore the accumulator to its previous value.
+            env.storage().instance().set(&day_key, &withdrawn_today);
             return Err(Error::TransferFailed);
         }
 
-        // Only record the withdrawal against today's accumulator once the
-        // transfer has actually succeeded.
-        env.storage().instance().set(&day_key, &new_total);
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -1548,6 +1589,199 @@ mod test {
         f.client().pay_xlm(&f.payer, &amount, &oid2);
 
         assert_eq!(f.xlm_balance(&f.treasury), amount);
+    }
+
+    // ── reentrancy guard: rescue_tokens and callbacks (issue #397) ─────────
+
+    /// A deliberately hostile "token" whose `transfer` tries to call back
+    /// into the receiver contract, the way a malicious token passed to
+    /// `rescue_tokens` could. It records whether the callback got through.
+    mod reentrant_token {
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
+
+        #[contracttype]
+        enum Key {
+            Receiver,
+            CallbackSucceeded,
+        }
+
+        #[contract]
+        pub struct ReentrantToken;
+
+        #[contractimpl]
+        impl ReentrantToken {
+            pub fn set_receiver(env: Env, receiver: Address) {
+                env.storage().instance().set(&Key::Receiver, &receiver);
+            }
+
+            pub fn decimals(_env: Env) -> u32 {
+                7
+            }
+
+            pub fn transfer(env: Env, from: Address, _to: Address, amount: i128) {
+                let receiver: Address = env.storage().instance().get(&Key::Receiver).unwrap();
+                let client = super::super::Stellar_CardReceiverClient::new(&env, &receiver);
+                // Re-enter the receiver while its own rescue_tokens call is
+                // still on the stack.
+                let callback = client.try_rescue_tokens(
+                    &from,
+                    &env.current_contract_address(),
+                    &from,
+                    &amount,
+                );
+                let payment = client.try_pay_usdc(&from, &amount, &Bytes::new(&env));
+                env.storage().instance().set(
+                    &Key::CallbackSucceeded,
+                    &(callback.is_ok() || payment.is_ok()),
+                );
+            }
+
+            pub fn callback_succeeded(env: Env) -> bool {
+                env.storage()
+                    .instance()
+                    .get(&Key::CallbackSucceeded)
+                    .unwrap_or(false)
+            }
+        }
+    }
+
+    fn reentrancy_guard_is_held(f: &Fixture) -> bool {
+        f.env.as_contract(&f.contract_id, || {
+            f.env
+                .storage()
+                .temporary()
+                .get::<_, bool>(&DataKey::ReentrancyGuard)
+                .unwrap_or(false)
+        })
+    }
+
+    #[test]
+    #[should_panic(expected = "reentrancy detected")]
+    fn test_reentrancy_guard_blocks_rescue_tokens_while_held() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.contract_id, 1_000_000);
+
+        f.env.as_contract(&f.contract_id, || {
+            f.env
+                .storage()
+                .temporary()
+                .set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "reentrancy detected")]
+    fn test_reentrancy_guard_blocks_pay_xlm_while_held() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_xlm(&f.payer, 1_000_000);
+
+        f.env.as_contract(&f.contract_id, || {
+            f.env
+                .storage()
+                .temporary()
+                .set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        f.client()
+            .pay_xlm(&f.payer, &1_000_000, &order_bytes(&f.env, "xlm-reentry"));
+    }
+
+    #[test]
+    fn test_reentrancy_guard_released_after_every_guarded_call() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.payer, 2_000_000);
+        f.mint_xlm(&f.payer, 1_000_000);
+        f.mint_usdc(&f.contract_id, 500_000);
+        let destination = Address::generate(&f.env);
+
+        f.client()
+            .pay_usdc(&f.payer, &1_000_000, &order_bytes(&f.env, "g-1"));
+        assert!(!reentrancy_guard_is_held(&f));
+
+        f.client()
+            .pay_xlm(&f.payer, &1_000_000, &order_bytes(&f.env, "g-2"));
+        assert!(!reentrancy_guard_is_held(&f));
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &500_000);
+        assert!(!reentrancy_guard_is_held(&f));
+
+        // Failed transfers (insufficient balance) must release it too.
+        assert_eq!(
+            f.client()
+                .try_pay_usdc(&f.payer, &5_000_000, &order_bytes(&f.env, "g-3")),
+            Err(Ok(Error::TransferFailed))
+        );
+        assert!(!reentrancy_guard_is_held(&f));
+
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &1),
+            Err(Ok(Error::TransferFailed))
+        );
+        assert!(!reentrancy_guard_is_held(&f));
+    }
+
+    #[test]
+    fn test_rejected_calls_never_acquire_the_guard() {
+        // Paused and invalid-amount rejections return before the guarded
+        // section, so they can't leave the guard set either.
+        let f = Fixture::new();
+        f.init();
+
+        assert_eq!(
+            f.client()
+                .try_pay_usdc(&f.payer, &0, &order_bytes(&f.env, "zero")),
+            Err(Ok(Error::InvalidAmount))
+        );
+        assert!(!reentrancy_guard_is_held(&f));
+
+        f.client().pause(&f.admin);
+        assert_eq!(
+            f.client()
+                .try_pay_xlm(&f.payer, &1, &order_bytes(&f.env, "paused")),
+            Err(Ok(Error::ContractPaused))
+        );
+        assert!(!reentrancy_guard_is_held(&f));
+    }
+
+    #[test]
+    fn test_rescue_tokens_callback_from_malicious_token_cannot_reenter() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &None, &Some(1_000));
+        f.mint_usdc(&f.admin, 10_000);
+
+        let evil = f.env.register(reentrant_token::ReentrantToken, ());
+        let evil_client = reentrant_token::ReentrantTokenClient::new(&f.env, &evil);
+        evil_client.set_receiver(&f.contract_id);
+
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &evil, &destination, &1_000);
+
+        // Neither the nested rescue_tokens nor the nested pay_usdc went
+        // through, so no USDC moved on the callback path.
+        assert!(!evil_client.callback_succeeded());
+        assert_eq!(f.usdc_balance(&f.treasury), 0);
+        assert_eq!(f.usdc_balance(&f.admin), 10_000);
+        assert!(!reentrancy_guard_is_held(&f));
+
+        // The single outer rescue used the whole daily budget: a callback
+        // can't have slipped a second withdrawal in against a stale total.
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &evil, &destination, &1),
+            Err(Ok(Error::DailyWithdrawLimitExceeded))
+        );
     }
 
     // ── comprehensive edge-case tests ─────────────────────────────────────
