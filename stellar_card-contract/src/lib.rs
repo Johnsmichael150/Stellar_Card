@@ -89,6 +89,12 @@ const INSTANCE_TTL_MAX: u32 = 17_280_000;
 /// instead of on (almost) every single one.
 const INSTANCE_TTL_THRESHOLD: u32 = INSTANCE_TTL_MAX / 2;
 
+/// Decimal precision `init` requires of both token contracts (Issue #399 -
+/// Part 2). Every Stellar Asset Contract — including the USDC and native XLM
+/// SACs this contract is built for — uses 7, and `pay_usdc`/`pay_xlm`
+/// document their `amount` in 7-decimal base units.
+const TOKEN_DECIMALS: u32 = 7;
+
 /// Represents user roles in the contract with hierarchical permissions.
 ///
 /// Roles are ordered by privilege: `Admin > Operator > Viewer`. A holder of a
@@ -178,12 +184,11 @@ impl Stellar_CardReceiver {
     /// * `xlm_contract` - The native XLM SAC contract address
     ///
     /// # Validation
-    /// Rejects reuse of the receiver contract as an admin, treasury, or token
-    /// contract; an admin that is also the treasury; duplicate token contracts;
-    /// and a treasury that points at either token contract. Also probes both
-    /// `usdc_contract` and `xlm_contract` with a `decimals()` call (Issue
-    /// #409 - Part 3) so a non-token address is rejected at init time rather
-    /// than surfacing on the first `pay_usdc`/`pay_xlm` call.
+    /// All parameters are checked by `validate_init_params` before any state
+    /// is written (Issue #399 - Part 2): the receiver contract can't be used
+    /// for any role; the admin can't be the treasury or a token contract;
+    /// the token contracts must differ and not double as the treasury; and
+    /// both must implement the token interface with 7 decimals.
     ///
     /// # Events (Issue #428 - Part 5)
     /// Emits: topics=[Symbol("init"), admin], value=(treasury, usdc_contract, xlm_contract)
@@ -211,59 +216,7 @@ impl Stellar_CardReceiver {
             panic!("already initialized");
         }
 
-        let contract_address = env.current_contract_address();
-
-        // Validate admin address
-        if admin == contract_address {
-            panic!("admin cannot be the contract itself");
-        }
-
-        // Validate treasury address
-        if treasury == contract_address {
-            panic!("treasury cannot be the contract itself");
-        }
-
-        // Prevent admin and treasury from being the same (accidental self-payment)
-        if admin == treasury {
-            panic!("admin and treasury must be different addresses");
-        }
-
-        // Validate token contracts are different (prevents misconfiguration)
-        if usdc_contract == xlm_contract {
-            panic!("usdc_contract and xlm_contract must be different");
-        }
-
-        // Validate token contracts are not the contract itself
-        if usdc_contract == contract_address {
-            panic!("usdc_contract cannot be the contract itself");
-        }
-        if xlm_contract == contract_address {
-            panic!("xlm_contract cannot be the contract itself");
-        }
-        if treasury == usdc_contract || treasury == xlm_contract {
-            panic!("treasury cannot be a configured token contract");
-        }
-
-        // Issue #409 (Part 3): probe both token addresses against the SAC
-        // interface before storing them. Without this, a plain non-token
-        // address (or a typo'd contract ID) would pass every check above and
-        // only surface as a failure the first time a payer calls pay_usdc /
-        // pay_xlm — by then the contract is already live and misconfigured.
-        // `decimals()` is a read-only call with no side effects, so probing
-        // it here costs nothing beyond the call itself and fails fast, at
-        // deploy time, instead of at the first payment.
-        if token::Client::new(&env, &usdc_contract)
-            .try_decimals()
-            .is_err()
-        {
-            panic!("usdc_contract does not implement the token interface");
-        }
-        if token::Client::new(&env, &xlm_contract)
-            .try_decimals()
-            .is_err()
-        {
-            panic!("xlm_contract does not implement the token interface");
-        }
+        Self::validate_init_params(&env, &admin, &treasury, &usdc_contract, &xlm_contract);
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
@@ -297,6 +250,88 @@ impl Stellar_CardReceiver {
                 xlm_contract.clone(),
             ),
         );
+    }
+
+    /// Validates `init`'s parameters before anything is written to storage
+    /// (Issue #399 - Part 2).
+    ///
+    /// Kept separate from `init` so every rule lives in one place and is
+    /// applied in a fixed order: cheap address-equality checks first, then
+    /// the token-interface probes, which make cross-contract calls.
+    ///
+    /// # Rules
+    /// * No role (admin, treasury, USDC, XLM) may be the receiver contract
+    ///   itself.
+    /// * The admin must not be the treasury (accidental self-payment) or
+    ///   either token contract (a token contract can't sign admin actions,
+    ///   so the contract would be unmanageable).
+    /// * USDC and XLM must be different contracts, and the treasury must not
+    ///   be either of them.
+    /// * Both token contracts must answer `decimals()` (Issue #409 - Part 3)
+    ///   and report [`TOKEN_DECIMALS`], the precision `pay_usdc`/`pay_xlm`
+    ///   amounts are documented in. A token with any other precision would
+    ///   silently mis-scale every payment by a power of ten.
+    ///
+    /// # Panics
+    /// Panics with a message naming the offending parameter on the first
+    /// rule that fails.
+    fn validate_init_params(
+        env: &Env,
+        admin: &Address,
+        treasury: &Address,
+        usdc_contract: &Address,
+        xlm_contract: &Address,
+    ) {
+        let contract_address = env.current_contract_address();
+
+        // No parameter may point back at this contract.
+        if *admin == contract_address {
+            panic!("admin cannot be the contract itself");
+        }
+        if *treasury == contract_address {
+            panic!("treasury cannot be the contract itself");
+        }
+        if *usdc_contract == contract_address {
+            panic!("usdc_contract cannot be the contract itself");
+        }
+        if *xlm_contract == contract_address {
+            panic!("xlm_contract cannot be the contract itself");
+        }
+
+        // Prevent admin and treasury from being the same (accidental self-payment)
+        if admin == treasury {
+            panic!("admin and treasury must be different addresses");
+        }
+        if admin == usdc_contract || admin == xlm_contract {
+            panic!("admin cannot be a configured token contract");
+        }
+
+        // Validate token contracts are different (prevents misconfiguration)
+        if usdc_contract == xlm_contract {
+            panic!("usdc_contract and xlm_contract must be different");
+        }
+        if treasury == usdc_contract || treasury == xlm_contract {
+            panic!("treasury cannot be a configured token contract");
+        }
+
+        // Issue #409 (Part 3): probe both token addresses against the SAC
+        // interface before storing them. Without this, a plain non-token
+        // address (or a typo'd contract ID) would pass every check above and
+        // only surface as a failure the first time a payer calls pay_usdc /
+        // pay_xlm — by then the contract is already live and misconfigured.
+        // `decimals()` is a read-only call with no side effects, so probing
+        // it here costs nothing beyond the call itself and fails fast, at
+        // deploy time, instead of at the first payment.
+        match token::Client::new(env, usdc_contract).try_decimals() {
+            Ok(Ok(TOKEN_DECIMALS)) => {}
+            Ok(Ok(_)) => panic!("usdc_contract must use 7 decimals"),
+            _ => panic!("usdc_contract does not implement the token interface"),
+        }
+        match token::Client::new(env, xlm_contract).try_decimals() {
+            Ok(Ok(TOKEN_DECIMALS)) => {}
+            Ok(Ok(_)) => panic!("xlm_contract must use 7 decimals"),
+            _ => panic!("xlm_contract does not implement the token interface"),
+        }
     }
 
     /// Acquires the reentrancy guard to prevent reentrant calls.
@@ -1266,6 +1301,195 @@ mod test {
             .is_err());
 
         assert!(client.try_admin().is_err());
+    }
+
+    // ── init parameter validation (issue #399) ────────────────────────────────
+
+    /// A contract that answers `decimals()` like a token but with a precision
+    /// other than the 7 every Stellar Asset Contract uses.
+    mod six_decimal_token {
+        use soroban_sdk::{contract, contractimpl, Env};
+
+        #[contract]
+        pub struct SixDecimalToken;
+
+        #[contractimpl]
+        impl SixDecimalToken {
+            pub fn decimals(_env: Env) -> u32 {
+                6
+            }
+        }
+    }
+
+    /// A contract with no token interface at all.
+    mod not_a_token {
+        use soroban_sdk::{contract, contractimpl, Env};
+
+        #[contract]
+        pub struct NotAToken;
+
+        #[contractimpl]
+        impl NotAToken {
+            pub fn hello(_env: Env) -> u32 {
+                1
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "admin cannot be the contract itself")]
+    fn test_init_rejects_contract_as_admin() {
+        let f = Fixture::new();
+        f.client()
+            .init(&f.contract_id, &f.treasury, &f.usdc, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "treasury cannot be the contract itself")]
+    fn test_init_rejects_contract_as_treasury() {
+        let f = Fixture::new();
+        f.client()
+            .init(&f.admin, &f.contract_id, &f.usdc, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "usdc_contract cannot be the contract itself")]
+    fn test_init_rejects_contract_as_usdc() {
+        let f = Fixture::new();
+        f.client()
+            .init(&f.admin, &f.treasury, &f.contract_id, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "xlm_contract cannot be the contract itself")]
+    fn test_init_rejects_contract_as_xlm() {
+        let f = Fixture::new();
+        f.client()
+            .init(&f.admin, &f.treasury, &f.usdc, &f.contract_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "admin and treasury must be different addresses")]
+    fn test_init_rejects_admin_as_treasury() {
+        let f = Fixture::new();
+        f.client().init(&f.admin, &f.admin, &f.usdc, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "admin cannot be a configured token contract")]
+    fn test_init_rejects_usdc_contract_as_admin() {
+        let f = Fixture::new();
+        f.client().init(&f.usdc, &f.treasury, &f.usdc, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "admin cannot be a configured token contract")]
+    fn test_init_rejects_xlm_contract_as_admin() {
+        let f = Fixture::new();
+        f.client()
+            .init(&f.xlm_sac, &f.treasury, &f.usdc, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "usdc_contract and xlm_contract must be different")]
+    fn test_init_rejects_same_token_for_usdc_and_xlm() {
+        let f = Fixture::new();
+        f.client().init(&f.admin, &f.treasury, &f.usdc, &f.usdc);
+    }
+
+    #[test]
+    #[should_panic(expected = "treasury cannot be a configured token contract")]
+    fn test_init_rejects_usdc_contract_as_treasury() {
+        let f = Fixture::new();
+        f.client().init(&f.admin, &f.usdc, &f.usdc, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "treasury cannot be a configured token contract")]
+    fn test_init_rejects_xlm_contract_as_treasury() {
+        let f = Fixture::new();
+        f.client().init(&f.admin, &f.xlm_sac, &f.usdc, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "usdc_contract does not implement the token interface")]
+    fn test_init_rejects_usdc_contract_without_token_interface() {
+        let f = Fixture::new();
+        let not_token = f.env.register(not_a_token::NotAToken, ());
+        f.client()
+            .init(&f.admin, &f.treasury, &not_token, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "xlm_contract does not implement the token interface")]
+    fn test_init_rejects_xlm_contract_without_token_interface() {
+        let f = Fixture::new();
+        let not_token = f.env.register(not_a_token::NotAToken, ());
+        f.client().init(&f.admin, &f.treasury, &f.usdc, &not_token);
+    }
+
+    #[test]
+    #[should_panic(expected = "usdc_contract does not implement the token interface")]
+    fn test_init_rejects_account_address_as_usdc_contract() {
+        // A plain generated address has no contract deployed behind it —
+        // e.g. a G-address pasted where a C-address was expected.
+        let f = Fixture::new();
+        let account = Address::generate(&f.env);
+        f.client().init(&f.admin, &f.treasury, &account, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "usdc_contract must use 7 decimals")]
+    fn test_init_rejects_usdc_contract_with_wrong_decimals() {
+        let f = Fixture::new();
+        let token = f.env.register(six_decimal_token::SixDecimalToken, ());
+        f.client().init(&f.admin, &f.treasury, &token, &f.xlm_sac);
+    }
+
+    #[test]
+    #[should_panic(expected = "xlm_contract must use 7 decimals")]
+    fn test_init_rejects_xlm_contract_with_wrong_decimals() {
+        let f = Fixture::new();
+        let token = f.env.register(six_decimal_token::SixDecimalToken, ());
+        f.client().init(&f.admin, &f.treasury, &f.usdc, &token);
+    }
+
+    #[test]
+    fn test_failed_init_leaves_contract_uninitialized_and_retryable() {
+        let f = Fixture::new();
+        let client = f.client();
+        let token = f.env.register(six_decimal_token::SixDecimalToken, ());
+
+        // Rejections from both phases: an address check and a token probe.
+        assert!(client
+            .try_init(&f.usdc, &f.treasury, &f.usdc, &f.xlm_sac)
+            .is_err());
+        assert!(client
+            .try_init(&f.admin, &f.treasury, &f.usdc, &token)
+            .is_err());
+
+        // Nothing was written: no admin, no role, no init event.
+        assert!(client.try_admin().is_err());
+        assert!(client.try_treasury().is_err());
+        assert_eq!(client.get_role(&f.admin), None);
+        assert_eq!(contract_event_count(&f.env, &f.contract_id, "init"), 0);
+
+        // A corrected call still succeeds, since "already initialized" was
+        // never tripped.
+        f.init();
+        assert_eq!(client.admin(), f.admin);
+        assert_eq!(client.get_role(&f.admin), Some(Role::Admin));
+    }
+
+    #[test]
+    fn test_init_accepts_a_contract_address_as_treasury() {
+        // The treasury only receives transfers, so a contract (e.g. a
+        // multisig or vault) is a valid treasury as long as it isn't one
+        // of the configured tokens or this contract.
+        let f = Fixture::new();
+        let vault = f.env.register(not_a_token::NotAToken, ());
+        f.client().init(&f.admin, &vault, &f.usdc, &f.xlm_sac);
+        assert_eq!(f.client().treasury(), vault);
     }
 
     // ── pay_usdc tests ────────────────────────────────────────────────────────
