@@ -123,13 +123,47 @@ event is documented at the top of `src/lib.rs`.
 # Build the WASM fixture and run contract unit tests
 make test
 
-# Run the initialized payment flow against local Quickstart
+# Run only the in-process integration suite (tests/integration.rs):
+# full multi-step flows through the public client, no Docker needed
+make contract-integration-test
+
+# Run the end-to-end suite against a local Quickstart network
 # Requires Docker and Stellar CLI
 make integration-test
 
 # Format contract source files
 cargo fmt --check
 ```
+
+### Integration tests
+
+There are two integration layers (Issue #400 - Part 2):
+
+- **`tests/integration.rs`** runs in-process with `cargo test` (so it is part
+  of `make test`). It drives the contract only through its public client, the
+  way a wallet or the backend would, across full flows: payments, incident
+  pause/resume, admin handover, role lifecycle, and `rescue_tokens` with daily
+  limits. Authorization is checked with specific signers where it matters,
+  not just `mock_all_auths`.
+- **`scripts/test_local_network.sh`** (`make integration-test`) starts a
+  `stellar/quickstart` container, deploys real USDC and native XLM asset
+  contracts plus the receiver, and asserts on real ledger state: getters,
+  balances, RBAC-gated pause, pause → unpause → payment, `rescue_tokens` with
+  per-call and daily limits, rejected calls, and the emitted `init` and
+  `pay_usdc` events. CI runs it on every contract change.
+
+The script can be tuned with environment variables:
+
+| Variable           | Default                     | Purpose                                              |
+|--------------------|-----------------------------|------------------------------------------------------|
+| `STELLAR_RPC_PORT` | `8000`                      | Host port to publish Quickstart on (avoid clashes)   |
+| `QUICKSTART_IMAGE` | `stellar/quickstart:latest` | Image to run, e.g. a pinned tag                      |
+| `RPC_WAIT_SECONDS` | `180`                       | How long to wait for RPC and friendbot to be healthy |
+| `KEEP_NETWORK`     | `0`                         | `1` leaves the container running for debugging       |
+| `SKIP_BUILD`       | `0`                         | `1` reuses an existing release WASM                  |
+
+On failure the script names the step that failed and prints the tail of the
+container logs.
 
 ## Security & Dependabot
 
