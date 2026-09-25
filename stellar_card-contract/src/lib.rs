@@ -762,14 +762,20 @@ impl Stellar_CardReceiver {
                 .storage()
                 .instance()
                 .set(&DataKey::WithdrawLimitPerCall, &v),
-            None => env.storage().instance().remove(&DataKey::WithdrawLimitPerCall),
+            None => env
+                .storage()
+                .instance()
+                .remove(&DataKey::WithdrawLimitPerCall),
         }
         match per_day {
             Some(v) => env
                 .storage()
                 .instance()
                 .set(&DataKey::WithdrawLimitPerDay, &v),
-            None => env.storage().instance().remove(&DataKey::WithdrawLimitPerDay),
+            None => env
+                .storage()
+                .instance()
+                .remove(&DataKey::WithdrawLimitPerDay),
         }
         Self::extend_instance_ttl(&env);
 
@@ -783,10 +789,7 @@ impl Stellar_CardReceiver {
     /// limits for `rescue_tokens`. `None` in either position means that
     /// limit is not configured.
     pub fn withdraw_limits(env: Env) -> (Option<i128>, Option<i128>) {
-        let per_call = env
-            .storage()
-            .instance()
-            .get(&DataKey::WithdrawLimitPerCall);
+        let per_call = env.storage().instance().get(&DataKey::WithdrawLimitPerCall);
         let per_day = env.storage().instance().get(&DataKey::WithdrawLimitPerDay);
         (per_call, per_day)
     }
@@ -1034,7 +1037,7 @@ impl Stellar_CardReceiver {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events, MockAuth, MockAuthInvoke},
+        testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke},
         token, Bytes, Env, IntoVal, Symbol, TryIntoVal,
     };
 
@@ -2906,7 +2909,8 @@ mod test {
     fn test_rescue_tokens_within_per_call_limit_succeeds() {
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
 
         f.mint_usdc(&f.contract_id, 1_000_000);
         let destination = Address::generate(&f.env);
@@ -2920,15 +2924,16 @@ mod test {
     fn test_rescue_tokens_over_per_call_limit_returns_err() {
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
 
         f.mint_usdc(&f.contract_id, 2_000_000);
         let destination = Address::generate(&f.env);
-        let result =
-            f.client()
-                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_001);
+        let result = f
+            .client()
+            .try_rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_001);
 
-        assert_eq!(result, Ok(Err(Error::WithdrawLimitExceeded)));
+        assert_eq!(result, Err(Ok(Error::WithdrawLimitExceeded)));
         // Balance must be untouched on rejection.
         assert_eq!(f.usdc_balance(&f.contract_id), 2_000_000);
     }
@@ -2937,7 +2942,8 @@ mod test {
     fn test_rescue_tokens_within_daily_limit_across_multiple_calls_succeeds() {
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+        f.client()
+            .set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
 
         f.mint_usdc(&f.contract_id, 1_000_000);
         let destination = Address::generate(&f.env);
@@ -2953,17 +2959,18 @@ mod test {
     fn test_rescue_tokens_exceeding_daily_limit_on_second_call_returns_err() {
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+        f.client()
+            .set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
 
         f.mint_usdc(&f.contract_id, 2_000_000);
         let destination = Address::generate(&f.env);
         f.client()
             .rescue_tokens(&f.admin, &f.usdc, &destination, &600_000);
-        let result =
-            f.client()
-                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &400_001);
+        let result = f
+            .client()
+            .try_rescue_tokens(&f.admin, &f.usdc, &destination, &400_001);
 
-        assert_eq!(result, Ok(Err(Error::DailyWithdrawLimitExceeded)));
+        assert_eq!(result, Err(Ok(Error::DailyWithdrawLimitExceeded)));
         // The rejected call must not have moved any funds or inflated the accumulator.
         assert_eq!(f.usdc_balance(&destination), 600_000);
     }
@@ -2972,7 +2979,8 @@ mod test {
     fn test_rescue_tokens_daily_limit_resets_on_the_next_day() {
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+        f.client()
+            .set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
 
         f.mint_usdc(&f.contract_id, 2_000_000);
         let destination = Address::generate(&f.env);
@@ -2996,7 +3004,8 @@ mod test {
     fn test_rescue_tokens_amount_still_counted_when_only_per_call_limit_set() {
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &Some(500_000), &None);
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(500_000), &None);
 
         f.mint_usdc(&f.contract_id, 500_000);
         let destination = Address::generate(&f.env);
@@ -3010,17 +3019,18 @@ mod test {
     fn test_rescue_tokens_failed_transfer_does_not_advance_daily_accumulator() {
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+        f.client()
+            .set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
 
         // No funds minted to the contract — the underlying token transfer
         // must fail (insufficient balance), which must not count against
         // the daily accumulator: a failed rescue shouldn't eat into the
         // day's remaining withdraw budget.
         let destination = Address::generate(&f.env);
-        let result =
-            f.client()
-                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &500_000);
-        assert_eq!(result, Ok(Err(Error::TransferFailed)));
+        let result = f
+            .client()
+            .try_rescue_tokens(&f.admin, &f.usdc, &destination, &500_000);
+        assert_eq!(result, Err(Ok(Error::TransferFailed)));
 
         // A second call for the same amount must still be within budget —
         // proof the first (failed) call left the accumulator untouched.
@@ -3037,14 +3047,15 @@ mod test {
         // hardcoded to one token contract.
         let f = Fixture::new();
         f.init();
-        f.client().set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
 
         f.mint_xlm(&f.contract_id, 2_000_000);
         let destination = Address::generate(&f.env);
-        let result =
-            f.client()
-                .try_rescue_tokens(&f.admin, &f.xlm_sac, &destination, &1_500_000);
-        assert_eq!(result, Ok(Err(Error::WithdrawLimitExceeded)));
+        let result = f
+            .client()
+            .try_rescue_tokens(&f.admin, &f.xlm_sac, &destination, &1_500_000);
+        assert_eq!(result, Err(Ok(Error::WithdrawLimitExceeded)));
 
         f.client()
             .rescue_tokens(&f.admin, &f.xlm_sac, &destination, &1_000_000);
