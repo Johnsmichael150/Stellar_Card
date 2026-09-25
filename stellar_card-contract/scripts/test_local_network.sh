@@ -135,4 +135,80 @@ if [ "$TREASURY_BALANCE" != "10000000" ]; then
   exit 1
 fi
 
+# Issue #410 (Part 3): the USDC path above only exercises pay_usdc — pay_xlm
+# has its own token client lookup and its own reentrancy-guard entry/exit, so
+# a regression there could ship even with the USDC assertion green. Exercise
+# it against the real local network the same way.
+echo "Executing a native XLM payment..."
+PAYER_XLM_BALANCE_BEFORE="$(stellar_local contract invoke \
+  --id "$XLM_CONTRACT_ID" \
+  --source deployer \
+  --network local \
+  -- balance \
+  --id "$PAYER_ADDRESS" | tr -d '[:space:]\"')"
+
+XLM_PAY_AMOUNT=5000000
+
+stellar_local contract invoke \
+  --id "$RECEIVER_CONTRACT_ID" \
+  --source payer \
+  --network local \
+  -- pay_xlm \
+  --from "$PAYER_ADDRESS" \
+  --amount "$XLM_PAY_AMOUNT" \
+  --order_id 6c6f63616c2d736d6f6b652d786c6d
+
+TREASURY_XLM_BALANCE="$(stellar_local contract invoke \
+  --id "$XLM_CONTRACT_ID" \
+  --source deployer \
+  --network local \
+  -- balance \
+  --id "$TREASURY_ADDRESS" | tr -d '[:space:]\"')"
+
+if [ "$TREASURY_XLM_BALANCE" != "$XLM_PAY_AMOUNT" ]; then
+  echo "Error: expected treasury XLM balance $XLM_PAY_AMOUNT, got $TREASURY_XLM_BALANCE" >&2
+  exit 1
+fi
+
+PAYER_XLM_BALANCE_AFTER="$(stellar_local contract invoke \
+  --id "$XLM_CONTRACT_ID" \
+  --source deployer \
+  --network local \
+  -- balance \
+  --id "$PAYER_ADDRESS" | tr -d '[:space:]\"')"
+
+if [ "$((PAYER_XLM_BALANCE_BEFORE - PAYER_XLM_BALANCE_AFTER))" != "$XLM_PAY_AMOUNT" ]; then
+  echo "Error: payer XLM balance did not decrease by $XLM_PAY_AMOUNT" >&2
+  exit 1
+fi
+
+# Issue #410 (Part 3): also exercise the pause circuit breaker end to end —
+# an admin-only path with real-network auth semantics that the in-memory
+# unit tests (mock_all_auths) can't fully stand in for.
+echo "Verifying pause blocks a subsequent payment..."
+stellar_local contract invoke \
+  --id "$RECEIVER_CONTRACT_ID" \
+  --source deployer \
+  --network local \
+  -- pause \
+  --caller "$DEPLOYER_ADDRESS"
+
+if stellar_local contract invoke \
+  --id "$RECEIVER_CONTRACT_ID" \
+  --source payer \
+  --network local \
+  -- pay_xlm \
+  --from "$PAYER_ADDRESS" \
+  --amount 1 \
+  --order_id 6c6f63616c2d7061757365642d747279 2>/dev/null; then
+  echo "Error: pay_xlm succeeded while the contract was paused" >&2
+  exit 1
+fi
+
+stellar_local contract invoke \
+  --id "$RECEIVER_CONTRACT_ID" \
+  --source deployer \
+  --network local \
+  -- unpause
+
 echo "Local network integration test passed."
