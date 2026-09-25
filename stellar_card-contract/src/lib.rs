@@ -21,17 +21,22 @@
 //!   **Completion of #424 (Part 5)**: RBAC fully implemented with role hierarchy,
 //!   grant/revoke operations, role queries, and hierarchical permission checks.
 //! * **Upgradeability** — the admin can swap the contract WASM in place.
-//! * **No admin withdraw path (issue #431, issue #421)** — `pay_usdc`/`pay_xlm` forward
-//!   funds directly from payer to `DataKey::Treasury` in the same call; the
+//! * **No admin withdraw path (issue #431, issue #421, issue #411)** — `pay_usdc`/`pay_xlm`
+//!   forward funds directly from payer to `DataKey::Treasury` in the same call; the
 //!   contract never holds custody of funds itself. An admin withdrawal
 //!   limit therefore has no function to attach to today — there is nothing
 //!   for an admin to withdraw. If a future change introduces fund custody
 //!   (e.g. an escrow/hold period), a withdrawal limit should be added at
 //!   that point, not before there's a withdrawal path to protect.
 //!
-//!   **Completion of #421 (Part 4)**: Administrative withdraw limit protections
-//!   are deferred until a withdrawal mechanism is introduced. See `rescue_tokens`
-//!   for the existing token recovery mechanism (for mistaken direct sends).
+//!   **Completion of #421 (Part 4) and #411 (Part 3)**: Administrative
+//!   withdraw limit protections are deferred until a withdrawal mechanism is
+//!   introduced — both issues asked for the same protection and resolve to
+//!   the same answer. See `rescue_tokens` for the existing token recovery
+//!   mechanism (for mistaken direct sends), which is itself Admin-role-gated
+//!   and unconditional per-call (not a running limit) precisely because it
+//!   recovers a fixed mistaken balance rather than acting as a general
+//!   withdrawal path.
 //!
 //! ## Authorization model
 //! `init` and every state-mutating administrative entrypoint require the caller
@@ -134,7 +139,10 @@ impl Stellar_CardReceiver {
     /// # Validation
     /// Rejects reuse of the receiver contract as an admin, treasury, or token
     /// contract; an admin that is also the treasury; duplicate token contracts;
-    /// and a treasury that points at either token contract.
+    /// and a treasury that points at either token contract. Also probes both
+    /// `usdc_contract` and `xlm_contract` with a `decimals()` call (Issue
+    /// #409 - Part 3) so a non-token address is rejected at init time rather
+    /// than surfacing on the first `pay_usdc`/`pay_xlm` call.
     ///
     /// # Events (Issue #428 - Part 5)
     /// Emits: topics=[Symbol("init"), admin], value=(treasury, usdc_contract, xlm_contract)
@@ -193,6 +201,27 @@ impl Stellar_CardReceiver {
         }
         if treasury == usdc_contract || treasury == xlm_contract {
             panic!("treasury cannot be a configured token contract");
+        }
+
+        // Issue #409 (Part 3): probe both token addresses against the SAC
+        // interface before storing them. Without this, a plain non-token
+        // address (or a typo'd contract ID) would pass every check above and
+        // only surface as a failure the first time a payer calls pay_usdc /
+        // pay_xlm — by then the contract is already live and misconfigured.
+        // `decimals()` is a read-only call with no side effects, so probing
+        // it here costs nothing beyond the call itself and fails fast, at
+        // deploy time, instead of at the first payment.
+        if token::Client::new(&env, &usdc_contract)
+            .try_decimals()
+            .is_err()
+        {
+            panic!("usdc_contract does not implement the token interface");
+        }
+        if token::Client::new(&env, &xlm_contract)
+            .try_decimals()
+            .is_err()
+        {
+            panic!("xlm_contract does not implement the token interface");
         }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
