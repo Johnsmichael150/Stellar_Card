@@ -110,8 +110,12 @@ Each successful payment emits one Soroban event. The `topic[0]` symbol identifie
 The backend event watcher filters on both `pay_usdc` and `pay_xlm` symbols.
 
 Administrative state changes emit `init`, `paused`, `unpaused`, `upgraded`,
-`admin_transferred`, `role_granted`, and `role_revoked` events. Idempotent
-operations do not emit events when no state changed.
+`tokens_rescued`, `withdraw_limits_set`, `admin_transferred`, `role_granted`,
+`role_revoked`, and `role_renounced` events. Idempotent operations
+(re-pausing, re-granting a role an address already holds, revoking or
+renouncing a role that isn't held) do not emit events when no state changed,
+so every event is a real state transition. The full topic/data layout of each
+event is documented at the top of `src/lib.rs`.
 
 ## Testing & Verification
 

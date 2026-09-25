@@ -40,6 +40,29 @@
 //!   recovers a fixed mistaken balance rather than acting as a general
 //!   withdrawal path.
 //!
+//! ## Events
+//! Every entrypoint that changes contract state emits exactly one event per
+//! change (Issue #398 - Part 2), and calls that turn out to be no-ops (pausing
+//! an already-paused contract, renouncing a role that isn't held, re-granting
+//! the role an address already has) emit nothing, so an indexer can treat
+//! each event as a real state transition. The first topic is always the
+//! event name:
+//!
+//! | Event                 | Topics                            | Data                                      |
+//! |-----------------------|-----------------------------------|-------------------------------------------|
+//! | `init`                | `admin`                           | `(treasury, usdc_contract, xlm_contract)` |
+//! | `pay_usdc`            | `order_id`, `from`                | `amount`                                  |
+//! | `pay_xlm`             | `order_id`, `from`                | `amount`                                  |
+//! | `paused`              | `caller`                          | `true`                                    |
+//! | `unpaused`            | `admin`                           | `false`                                   |
+//! | `upgraded`            | `admin`                           | `new_wasm_hash`                           |
+//! | `tokens_rescued`      | `token_contract`, `to`            | `(caller, amount)`                        |
+//! | `withdraw_limits_set` | `caller`                          | `(per_call, per_day)`                     |
+//! | `admin_transferred`   | `old_admin`, `new_admin`          | `()`                                      |
+//! | `role_granted`        | `address`                         | `role`                                    |
+//! | `role_revoked`        | `address`                         | `()`                                      |
+//! | `role_renounced`      | `caller`                          | `()`                                      |
+//!
 //! ## Authorization model
 //! `init` and every state-mutating administrative entrypoint require the caller
 //! to authorize via Soroban's `require_auth`. Payment entrypoints require the
@@ -693,6 +716,10 @@ impl Stellar_CardReceiver {
     /// Interactions), because `token_contract` is caller-supplied and may
     /// call back into this contract.
     ///
+    /// # Events (Issue #398 - Part 2)
+    /// Emits: topics=[Symbol("tokens_rescued"), token_contract, to],
+    /// value=(caller, amount). Not emitted when the call returns an error.
+    ///
     /// # Panics
     /// Panics if `caller` does not hold the `Admin` role, if
     /// `caller.require_auth()` fails, or with "reentrancy detected" if
@@ -712,7 +739,7 @@ impl Stellar_CardReceiver {
         // themselves. Accept either form of admin authority here.
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let is_stored_admin = caller == stored_admin;
-        if !is_stored_admin && !Self::has_role(env.clone(), caller, Role::Admin) {
+        if !is_stored_admin && !Self::has_role(env.clone(), caller.clone(), Role::Admin) {
             panic!("rescue_tokens requires the Admin role");
         }
         if amount <= 0 {
@@ -767,6 +794,15 @@ impl Stellar_CardReceiver {
         }
 
         Self::extend_instance_ttl(&env);
+
+        // Issue #398 (Part 2): moving funds out of the contract is the most
+        // sensitive state change it can make, so it must be visible to
+        // off-chain monitoring like every other admin action. Only emitted
+        // once the transfer has succeeded.
+        env.events().publish(
+            (Symbol::new(&env, "tokens_rescued"), token_contract, to),
+            (caller, amount),
+        );
         Ok(())
     }
 
@@ -896,7 +932,8 @@ impl Stellar_CardReceiver {
     /// rent on every call.
     ///
     /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("role_granted"), address], value=role
+    /// Emits: topics=[Symbol("role_granted"), address], value=role — only
+    /// when the address's stored role actually changes (Issue #398 - Part 2).
     ///
     /// # Panics
     /// Panics if called before `init`, or if `admin.require_auth()` fails.
@@ -904,13 +941,7 @@ impl Stellar_CardReceiver {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
-        let key = DataKey::UserRole(address.clone());
-        env.storage().persistent().set(&key, &role);
-        Self::extend_role_ttl(&env, &key);
-
-        // Emit role granted event (Issue #428 - Part 5)
-        env.events()
-            .publish((Symbol::new(&env, "role_granted"), address), role);
+        Self::store_role(&env, address, role);
     }
 
     /// Grants the same role to several addresses in a single call.
@@ -931,20 +962,37 @@ impl Stellar_CardReceiver {
     /// `addresses` list is a no-op.
     ///
     /// # Events
-    /// Emits one `role_granted` event per address, matching `grant_role`.
+    /// Emits one `role_granted` event per address whose role actually
+    /// changed, matching `grant_role`.
     pub fn grant_roles(env: Env, addresses: Vec<Address>, role: Role) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
         for address in addresses.iter() {
-            let key = DataKey::UserRole(address.clone());
-            env.storage().persistent().set(&key, &role);
-            Self::extend_role_ttl(&env, &key);
-            env.events()
-                .publish((Symbol::new(&env, "role_granted"), address), role);
+            Self::store_role(&env, address, role);
         }
 
         Self::extend_instance_ttl(&env);
+    }
+
+    /// Assigns `role` to `address` and emits `role_granted` — shared by
+    /// `grant_role` and `grant_roles` so both follow the same rules.
+    ///
+    /// # Events (Issue #398 - Part 2)
+    /// The event is only emitted when the stored role actually changes.
+    /// Re-granting the role an address already holds still refreshes the
+    /// entry's TTL, but is not reported as a new grant.
+    fn store_role(env: &Env, address: Address, role: Role) {
+        let key = DataKey::UserRole(address.clone());
+        let previous: Option<Role> = env.storage().persistent().get(&key);
+        env.storage().persistent().set(&key, &role);
+        Self::extend_role_ttl(env, &key);
+
+        if previous != Some(role) {
+            // Emit role granted event (Issue #428 - Part 5)
+            env.events()
+                .publish((Symbol::new(env, "role_granted"), address), role);
+        }
     }
 
     /// Revokes a role from an address.
@@ -994,7 +1042,8 @@ impl Stellar_CardReceiver {
     /// of waiting on the admin to call `revoke_role`.
     ///
     /// # Events
-    /// Emits: topics=[Symbol("role_renounced"), caller], value=()
+    /// Emits: topics=[Symbol("role_renounced"), caller], value=() — only
+    /// when the caller actually held a role (Issue #398 - Part 2).
     ///
     /// # Notes
     /// Renouncing a role the caller doesn't hold is a no-op, matching
@@ -1010,9 +1059,14 @@ impl Stellar_CardReceiver {
     pub fn renounce_role(env: Env, caller: Address) {
         caller.require_auth();
 
-        env.storage()
-            .persistent()
-            .remove(&DataKey::UserRole(caller.clone()));
+        // Issue #398 (Part 2): renouncing a role that isn't held changes
+        // nothing, so — like `revoke_role` — it must not emit an event that
+        // an indexer would record as a real role change.
+        let key = DataKey::UserRole(caller.clone());
+        if !env.storage().persistent().has(&key) {
+            return;
+        }
+        env.storage().persistent().remove(&key);
 
         env.events()
             .publish((Symbol::new(&env, "role_renounced"), caller), ());
@@ -2952,6 +3006,213 @@ mod test {
         assert_eq!(contract_event_count(&f.env, &f.contract_id, "unpaused"), 1);
         f.client().unpause();
         assert_eq!(contract_event_count(&f.env, &f.contract_id, "unpaused"), 0);
+    }
+
+    // ── state-change event coverage (issue #398) ──────────────────────────────
+
+    /// Returns `(topics, data)` of the single event named `name` that this
+    /// contract emitted during the last invocation, panicking if there
+    /// isn't exactly one.
+    fn single_contract_event(
+        f: &Fixture,
+        name: &str,
+    ) -> (soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val) {
+        let symbol = Symbol::new(&f.env, name);
+        let mut found = None;
+        for (event_contract, topics, data) in f.env.events().all().iter() {
+            if event_contract != f.contract_id {
+                continue;
+            }
+            let event_symbol: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if event_symbol == symbol {
+                assert!(found.is_none(), "more than one `{}` event emitted", name);
+                found = Some((topics, data));
+            }
+        }
+        found.unwrap_or_else(|| panic!("no `{}` event emitted", name))
+    }
+
+    #[test]
+    fn test_rescue_tokens_emits_tokens_rescued_event() {
+        let f = Fixture::new();
+        f.init();
+        f.mint_usdc(&f.contract_id, 400_000);
+        let destination = Address::generate(&f.env);
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &400_000);
+
+        let (topics, data) = single_contract_event(&f, "tokens_rescued");
+        assert_eq!(topics.len(), 3);
+        let token_topic: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+        let to_topic: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+        let (caller, amount): (Address, i128) = data.try_into_val(&f.env).unwrap();
+        assert_eq!(token_topic, f.usdc);
+        assert_eq!(to_topic, destination);
+        assert_eq!(caller, f.admin);
+        assert_eq!(amount, 400_000);
+    }
+
+    #[test]
+    fn test_failed_rescue_tokens_emits_no_event() {
+        let f = Fixture::new();
+        f.init();
+        let destination = Address::generate(&f.env);
+
+        // Insufficient contract balance -> TransferFailed.
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &1),
+            Err(Ok(Error::TransferFailed))
+        );
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "tokens_rescued"),
+            0
+        );
+
+        // Rejected by the per-call limit before any transfer is attempted.
+        f.client().set_withdraw_limits(&f.admin, &Some(10), &None);
+        f.mint_usdc(&f.contract_id, 100);
+        assert_eq!(
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &11),
+            Err(Ok(Error::WithdrawLimitExceeded))
+        );
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "tokens_rescued"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_set_withdraw_limits_emits_event_with_new_limits() {
+        let f = Fixture::new();
+        f.init();
+
+        f.client().set_withdraw_limits(&f.admin, &Some(250), &None);
+
+        let (topics, data) = single_contract_event(&f, "withdraw_limits_set");
+        let caller: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+        let limits: (Option<i128>, Option<i128>) = data.try_into_val(&f.env).unwrap();
+        assert_eq!(caller, f.admin);
+        assert_eq!(limits, (Some(250), None));
+    }
+
+    #[test]
+    fn test_transfer_admin_emits_event_with_old_and_new_admin() {
+        let f = Fixture::new();
+        f.init();
+        let new_admin = Address::generate(&f.env);
+
+        f.client().transfer_admin(&new_admin);
+
+        let (topics, _) = single_contract_event(&f, "admin_transferred");
+        let old: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+        let new: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(old, f.admin);
+        assert_eq!(new, new_admin);
+    }
+
+    #[test]
+    fn test_renounce_role_not_held_emits_no_event() {
+        let f = Fixture::new();
+        f.init();
+        let user = Address::generate(&f.env);
+
+        f.client().renounce_role(&user);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "role_renounced"),
+            0
+        );
+
+        // Renouncing twice: only the first call is a real change.
+        f.client().grant_role(&user, &Role::Operator);
+        f.client().renounce_role(&user);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "role_renounced"),
+            1
+        );
+        f.client().renounce_role(&user);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "role_renounced"),
+            0
+        );
+    }
+
+    #[test]
+    fn test_grant_role_emits_only_when_role_changes() {
+        let f = Fixture::new();
+        f.init();
+        let user = Address::generate(&f.env);
+
+        f.client().grant_role(&user, &Role::Viewer);
+        let (_, data) = single_contract_event(&f, "role_granted");
+        let role: Role = data.try_into_val(&f.env).unwrap();
+        assert_eq!(role, Role::Viewer);
+
+        // Same role again: nothing changed, so no event.
+        f.client().grant_role(&user, &Role::Viewer);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "role_granted"),
+            0
+        );
+        assert_eq!(f.client().get_role(&user), Some(Role::Viewer));
+
+        // A different role is a real change and is reported.
+        f.client().grant_role(&user, &Role::Operator);
+        let (_, data) = single_contract_event(&f, "role_granted");
+        let role: Role = data.try_into_val(&f.env).unwrap();
+        assert_eq!(role, Role::Operator);
+    }
+
+    #[test]
+    fn test_grant_roles_emits_only_for_addresses_whose_role_changed() {
+        let f = Fixture::new();
+        f.init();
+        let already_viewer = Address::generate(&f.env);
+        let fresh = Address::generate(&f.env);
+        let was_operator = Address::generate(&f.env);
+        f.client().grant_role(&already_viewer, &Role::Viewer);
+        f.client().grant_role(&was_operator, &Role::Operator);
+
+        let batch = soroban_sdk::vec![
+            &f.env,
+            already_viewer.clone(),
+            fresh.clone(),
+            was_operator.clone()
+        ];
+        f.client().grant_roles(&batch, &Role::Viewer);
+
+        let mut granted = soroban_sdk::Vec::<Address>::new(&f.env);
+        for (event_contract, topics, _) in f.env.events().all().iter() {
+            if event_contract != f.contract_id {
+                continue;
+            }
+            let name: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if name == Symbol::new(&f.env, "role_granted") {
+                granted.push_back(topics.get(1).unwrap().try_into_val(&f.env).unwrap());
+            }
+        }
+        assert_eq!(granted, soroban_sdk::vec![&f.env, fresh, was_operator]);
+    }
+
+    #[test]
+    fn test_revoke_role_emits_single_event_only_for_held_role() {
+        let f = Fixture::new();
+        f.init();
+        let user = Address::generate(&f.env);
+        f.client().grant_role(&user, &Role::Viewer);
+
+        f.client().revoke_role(&user);
+        let (topics, _) = single_contract_event(&f, "role_revoked");
+        let revoked: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
+        assert_eq!(revoked, user);
+
+        f.client().revoke_role(&user);
+        assert_eq!(
+            contract_event_count(&f.env, &f.contract_id, "role_revoked"),
+            0
+        );
     }
 
     #[test]
