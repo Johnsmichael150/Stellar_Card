@@ -103,6 +103,17 @@ pub enum DataKey {
     ReentrancyGuard,
     /// Circuit breaker: when true, `pay_usdc`/`pay_xlm` refuse new payments.
     Paused,
+    /// Maximum amount `rescue_tokens` may move in a single call. Key
+    /// absent means no per-call cap is configured.
+    WithdrawLimitPerCall,
+    /// Maximum cumulative amount `rescue_tokens` may move across all calls
+    /// within a single day. Key absent means no daily cap.
+    WithdrawLimitPerDay,
+    /// Running total withdrawn via `rescue_tokens` during `day` (ledger
+    /// timestamp / 86400), keyed per day so the accumulator resets
+    /// automatically at each day boundary instead of needing an explicit
+    /// reset call.
+    WithdrawnToday(u64),
 }
 
 /// Contract errors
@@ -116,6 +127,11 @@ pub enum Error {
     TransferFailed = 2,
     /// The contract is paused; no new payments are accepted until unpaused
     ContractPaused = 3,
+    /// `rescue_tokens` amount exceeds the configured per-call withdraw limit
+    WithdrawLimitExceeded = 4,
+    /// `rescue_tokens` amount would push today's cumulative withdrawals past
+    /// the configured daily withdraw limit
+    DailyWithdrawLimitExceeded = 5,
 }
 
 /// The stellar_card card receiver contract.
@@ -642,6 +658,10 @@ impl Stellar_CardReceiver {
     ///
     /// # Errors
     /// * `InvalidAmount` - If `amount` is <= 0
+    /// * `WithdrawLimitExceeded` - If a per-call limit is configured and
+    ///   `amount` exceeds it
+    /// * `DailyWithdrawLimitExceeded` - If a daily limit is configured and
+    ///   this withdrawal would push today's cumulative total past it
     /// * `TransferFailed` - If the underlying token transfer fails (e.g. the
     ///   contract's balance is lower than `amount`)
     ///
@@ -670,13 +690,105 @@ impl Stellar_CardReceiver {
             return Err(Error::InvalidAmount);
         }
 
+        if let Some(per_call_limit) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::WithdrawLimitPerCall)
+        {
+            if amount > per_call_limit {
+                return Err(Error::WithdrawLimitExceeded);
+            }
+        }
+
+        let day = env.ledger().timestamp() / 86_400;
+        let day_key = DataKey::WithdrawnToday(day);
+        let withdrawn_today: i128 = env.storage().instance().get(&day_key).unwrap_or(0);
+        let new_total = withdrawn_today.saturating_add(amount);
+
+        if let Some(daily_limit) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::WithdrawLimitPerDay)
+        {
+            if new_total > daily_limit {
+                return Err(Error::DailyWithdrawLimitExceeded);
+            }
+        }
+
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &token_contract);
         let res = token_client.try_transfer(&contract_address, &to, &amount);
         if res.is_err() {
             return Err(Error::TransferFailed);
         }
+
+        // Only record the withdrawal against today's accumulator once the
+        // transfer has actually succeeded.
+        env.storage().instance().set(&day_key, &new_total);
+        Self::extend_instance_ttl(&env);
         Ok(())
+    }
+
+    /// Configures `rescue_tokens`'s withdraw limits (Admin-role gated).
+    ///
+    /// # Arguments
+    /// * `per_call` - Maximum amount a single `rescue_tokens` call may move,
+    ///   or `None` to remove the per-call cap.
+    /// * `per_day` - Maximum cumulative amount `rescue_tokens` may move
+    ///   within a single day, or `None` to remove the daily cap.
+    ///
+    /// # Panics
+    /// Panics if `caller` does not hold the `Admin` role (or is not the
+    /// stored admin), if `caller.require_auth()` fails, or if either limit
+    /// is provided as <= 0.
+    pub fn set_withdraw_limits(
+        env: Env,
+        caller: Address,
+        per_call: Option<i128>,
+        per_day: Option<i128>,
+    ) {
+        caller.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let is_stored_admin = caller == stored_admin;
+        if !is_stored_admin && !Self::has_role(env.clone(), caller.clone(), Role::Admin) {
+            panic!("set_withdraw_limits requires the Admin role");
+        }
+        if per_call.is_some_and(|v| v <= 0) || per_day.is_some_and(|v| v <= 0) {
+            panic!("withdraw limits must be positive when set");
+        }
+
+        match per_call {
+            Some(v) => env
+                .storage()
+                .instance()
+                .set(&DataKey::WithdrawLimitPerCall, &v),
+            None => env.storage().instance().remove(&DataKey::WithdrawLimitPerCall),
+        }
+        match per_day {
+            Some(v) => env
+                .storage()
+                .instance()
+                .set(&DataKey::WithdrawLimitPerDay, &v),
+            None => env.storage().instance().remove(&DataKey::WithdrawLimitPerDay),
+        }
+        Self::extend_instance_ttl(&env);
+
+        env.events().publish(
+            (Symbol::new(&env, "withdraw_limits_set"), caller),
+            (per_call, per_day),
+        );
+    }
+
+    /// Returns the currently configured `(per_call, per_day)` withdraw
+    /// limits for `rescue_tokens`. `None` in either position means that
+    /// limit is not configured.
+    pub fn withdraw_limits(env: Env) -> (Option<i128>, Option<i128>) {
+        let per_call = env
+            .storage()
+            .instance()
+            .get(&DataKey::WithdrawLimitPerCall);
+        let per_day = env.storage().instance().get(&DataKey::WithdrawLimitPerDay);
+        (per_call, per_day)
     }
 
     /// Begins a two-step handover of the admin address. Unlike a naive
@@ -2737,6 +2849,208 @@ mod test {
         assert_eq!(
             token::Client::new(&f.env, &other_token).balance(&destination),
             amount
+        );
+    }
+
+    // ── withdraw limit tests (issue #401) ───────────────────────────────────────
+
+    #[test]
+    fn test_withdraw_limits_default_to_unset() {
+        let f = Fixture::new();
+        f.init();
+        assert_eq!(f.client().withdraw_limits(), (None, None));
+    }
+
+    #[test]
+    fn test_set_withdraw_limits_works() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(1_000_000), &Some(5_000_000));
+        assert_eq!(
+            f.client().withdraw_limits(),
+            (Some(1_000_000), Some(5_000_000))
+        );
+    }
+
+    #[test]
+    fn test_set_withdraw_limits_can_clear_a_limit() {
+        let f = Fixture::new();
+        f.init();
+        f.client()
+            .set_withdraw_limits(&f.admin, &Some(1_000_000), &Some(5_000_000));
+        f.client().set_withdraw_limits(&f.admin, &None, &None);
+        assert_eq!(f.client().withdraw_limits(), (None, None));
+    }
+
+    #[test]
+    #[should_panic(expected = "set_withdraw_limits requires the Admin role")]
+    fn test_set_withdraw_limits_requires_admin_role() {
+        let f = Fixture::new();
+        f.init();
+        let operator = Address::generate(&f.env);
+        f.client().grant_role(&operator, &Role::Operator);
+        f.client()
+            .set_withdraw_limits(&operator, &Some(1_000_000), &None);
+    }
+
+    #[test]
+    #[should_panic(expected = "withdraw limits must be positive when set")]
+    fn test_set_withdraw_limits_rejects_non_positive_per_call() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &Some(0), &None);
+    }
+
+    #[test]
+    fn test_rescue_tokens_within_per_call_limit_succeeds() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
+
+        f.mint_usdc(&f.contract_id, 1_000_000);
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_000);
+
+        assert_eq!(f.usdc_balance(&destination), 1_000_000);
+    }
+
+    #[test]
+    fn test_rescue_tokens_over_per_call_limit_returns_err() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
+
+        f.mint_usdc(&f.contract_id, 2_000_000);
+        let destination = Address::generate(&f.env);
+        let result =
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_001);
+
+        assert_eq!(result, Ok(Err(Error::WithdrawLimitExceeded)));
+        // Balance must be untouched on rejection.
+        assert_eq!(f.usdc_balance(&f.contract_id), 2_000_000);
+    }
+
+    #[test]
+    fn test_rescue_tokens_within_daily_limit_across_multiple_calls_succeeds() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+
+        f.mint_usdc(&f.contract_id, 1_000_000);
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &600_000);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &400_000);
+
+        assert_eq!(f.usdc_balance(&destination), 1_000_000);
+    }
+
+    #[test]
+    fn test_rescue_tokens_exceeding_daily_limit_on_second_call_returns_err() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+
+        f.mint_usdc(&f.contract_id, 2_000_000);
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &600_000);
+        let result =
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &400_001);
+
+        assert_eq!(result, Ok(Err(Error::DailyWithdrawLimitExceeded)));
+        // The rejected call must not have moved any funds or inflated the accumulator.
+        assert_eq!(f.usdc_balance(&destination), 600_000);
+    }
+
+    #[test]
+    fn test_rescue_tokens_daily_limit_resets_on_the_next_day() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+
+        f.mint_usdc(&f.contract_id, 2_000_000);
+        let destination = Address::generate(&f.env);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_000);
+
+        // Advance the ledger clock by a full day.
+        f.env.ledger().with_mut(|li| {
+            li.timestamp += 86_400;
+        });
+
+        // A fresh day's accumulator is empty, so this succeeds even though
+        // the prior call already used up the "previous day"'s full limit.
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &1_000_000);
+
+        assert_eq!(f.usdc_balance(&destination), 2_000_000);
+    }
+
+    #[test]
+    fn test_rescue_tokens_amount_still_counted_when_only_per_call_limit_set() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &Some(500_000), &None);
+
+        f.mint_usdc(&f.contract_id, 500_000);
+        let destination = Address::generate(&f.env);
+        // Exactly at the limit must succeed (limit is inclusive).
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &500_000);
+        assert_eq!(f.usdc_balance(&destination), 500_000);
+    }
+
+    #[test]
+    fn test_rescue_tokens_failed_transfer_does_not_advance_daily_accumulator() {
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &None, &Some(1_000_000));
+
+        // No funds minted to the contract — the underlying token transfer
+        // must fail (insufficient balance), which must not count against
+        // the daily accumulator: a failed rescue shouldn't eat into the
+        // day's remaining withdraw budget.
+        let destination = Address::generate(&f.env);
+        let result =
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.usdc, &destination, &500_000);
+        assert_eq!(result, Ok(Err(Error::TransferFailed)));
+
+        // A second call for the same amount must still be within budget —
+        // proof the first (failed) call left the accumulator untouched.
+        f.mint_usdc(&f.contract_id, 500_000);
+        f.client()
+            .rescue_tokens(&f.admin, &f.usdc, &destination, &500_000);
+        assert_eq!(f.usdc_balance(&destination), 500_000);
+    }
+
+    #[test]
+    fn test_rescue_tokens_xlm_sac_respects_withdraw_limits_too() {
+        // The withdraw limit applies to rescue_tokens generically, not just
+        // to USDC — exercised here against the XLM SAC to prove it isn't
+        // hardcoded to one token contract.
+        let f = Fixture::new();
+        f.init();
+        f.client().set_withdraw_limits(&f.admin, &Some(1_000_000), &None);
+
+        f.mint_xlm(&f.contract_id, 2_000_000);
+        let destination = Address::generate(&f.env);
+        let result =
+            f.client()
+                .try_rescue_tokens(&f.admin, &f.xlm_sac, &destination, &1_500_000);
+        assert_eq!(result, Ok(Err(Error::WithdrawLimitExceeded)));
+
+        f.client()
+            .rescue_tokens(&f.admin, &f.xlm_sac, &destination, &1_000_000);
+        assert_eq!(
+            token::Client::new(&f.env, &f.xlm_sac).balance(&destination),
+            1_000_000
         );
     }
 

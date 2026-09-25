@@ -16,7 +16,7 @@ WASM_SIZE_BUDGET_BYTES := 61440
 build:
 	cargo build --target wasm32-unknown-unknown --release
 	@if command -v wasm-opt >/dev/null 2>&1; then \
-		wasm-opt -Oz \
+		wasm-opt -Oz --strip-debug --strip-producers -c \
 			$(WASM_PATH) \
 			-o $(WASM_PATH); \
 	else \
