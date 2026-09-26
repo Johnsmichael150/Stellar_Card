@@ -527,6 +527,7 @@ impl Stellar_CardReceiver {
         env.events()
             .publish((Symbol::new(&env, "pay_usdc"), order_id, from), amount);
 
+        // Optimization #1: conditional TTL extension — write only when needed.
         Self::extend_instance_ttl(&env);
         Ok(())
     }
@@ -864,7 +865,9 @@ impl Stellar_CardReceiver {
             Self::store_role(&env, address, role);
         }
 
-        Self::extend_instance_ttl(&env);
+    /// Returns the admin address.
+    pub fn admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     /// Assigns `role` to `address` and emits `role_granted` — shared by
