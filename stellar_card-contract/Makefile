@@ -1,4 +1,4 @@
-.PHONY: build test integration-test wasm-size
+.PHONY: build test contract-integration-test integration-test wasm-size
 
 WASM_PATH := target/wasm32-unknown-unknown/release/stellar_card_receiver.wasm
 # Soroban's own network-enforced ceiling is 64KiB (65536 bytes). This budget
@@ -45,5 +45,11 @@ test:
 	cargo build --target wasm32v1-none --release
 	cargo test
 
+# Issue #400 (Part 2): in-process integration suite only (tests/integration.rs).
+# Also runs as part of `make test`; this target is for quick iteration.
+contract-integration-test:
+	cargo test --test integration
+
+# End-to-end suite against a local Quickstart network (needs Docker + Stellar CLI).
 integration-test:
 	./scripts/test_local_network.sh
