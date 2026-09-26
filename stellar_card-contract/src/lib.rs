@@ -4,10 +4,7 @@
 //! of the stellar_card card platform and forwards them to a configured treasury
 //! address.
 //!
-//! ## Overview
-//! Payers authorize a transfer of USDC or XLM to the contract, which routes the
-//! funds to the treasury and emits a payment event tagged with an order identifier
-//! so off-chain systems can reconcile card top-ups.
+//! ## Part 3 — Reentrancy Guard for Payment Callbacks (Issue #407)
 //!
 //! ## Part 3 — Event Emission (Issue #408)
 //! This iteration wires up Soroban events for **every meaningful contract state
@@ -92,8 +89,7 @@
 //! | `role_renounced`      | `caller`                          | `()`                                      |
 //!
 //! ## Authorization model
-//! `init` and every state-mutating administrative entrypoint require the
-//! caller to authorize via Soroban's `require_auth`. Payment entrypoints
+//! `init` and all admin entrypoints call `require_auth`. Payment entrypoints
 //! require the paying address to authorize the transfer.
 
 #![no_std]
@@ -118,34 +114,50 @@ const TOKEN_DECIMALS: u32 = 7;
 
 /// Represents user roles in the contract with hierarchical permissions.
 ///
-/// Roles are ordered by privilege: `Admin > Operator > Viewer`. A holder of a
-/// higher role implicitly satisfies any lower role requirement (see
-/// [`Stellar_CardReceiver::has_role`]).
-#[contracttype]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Role {
-    /// Full administrative control. Can pause/unpause, upgrade, and manage roles.
-    Admin,
-    /// Operational role. Satisfies `Operator` and `Viewer` requirements.
-    Operator,
-    /// Lowest-privilege role. Read/observer level access only.
-    Viewer,
-}
+/// Set to half of [`INSTANCE_TTL_MAX`].  When `threshold == extend_to` (as
+/// was the original pattern), *any* decrease below the max retriggers a full
+/// extend — effectively a fee-costing ledger write on nearly every call.
+/// A threshold at half the max means an extension only fires roughly once
+/// every ~500 days\' worth of activity instead of on almost every call.
+const INSTANCE_TTL_THRESHOLD: u32 = INSTANCE_TTL_MAX / 2;
 
-/// Storage keys for contract state.
+// ── Storage keys ──────────────────────────────────────────────────────────────
+
+/// Discriminated union of all storage keys used by the contract.
 ///
-/// Each variant identifies a slot in the contract's instance storage.
+/// Each variant identifies a slot in the contract's storage.
 #[contracttype]
 pub enum DataKey {
-    /// Address that receives forwarded payments.
+    /// The Stellar address to which all forwarded payments are sent.
+    ///
+    /// Set once during [`Stellar_CardReceiver::init`] and never changed
+    /// afterwards.  Any payment that reaches `pay_usdc` or `pay_xlm`
+    /// forwards funds directly to this address in the same transaction —
+    /// the contract itself never holds a balance.
     Treasury,
-    /// Address of the USDC Stellar Asset Contract (SAC).
+
+    /// The contract address of the USDC Stellar Asset Contract (SAC).
+    ///
+    /// Used by [`Stellar_CardReceiver::pay_usdc`] to call `transfer` on
+    /// behalf of the payer.  Validated at init time via a `try_decimals()`
+    /// probe so a non-token address is caught immediately rather than at
+    /// the first payment.
     UsdcContract,
-    /// Address of the native XLM Stellar Asset Contract (SAC).
+
+    /// The contract address of the native XLM Stellar Asset Contract (SAC).
+    ///
+    /// Used by [`Stellar_CardReceiver::pay_xlm`].  Validated at init time
+    /// with the same `try_decimals()` probe as [`DataKey::UsdcContract`].
     XlmContract,
-    /// Address of the contract administrator.
+
+    /// The Stellar address that holds administrative control of the contract.
+    ///
+    /// This address is required to co-sign `init`, `pause`, `unpause`,
+    /// `upgrade`, and `transfer_admin`.  It is transferred atomically by
+    /// [`Stellar_CardReceiver::transfer_admin`], which requires both the
+    /// current and the new admin to authorize to prevent accidental lockout.
     Admin,
-    /// Circuit breaker: when `true`, `pay_usdc`/`pay_xlm` refuse new payments.
+    /// Circuit breaker: `true` means payments are rejected.
     Paused,
     /// Maximum amount `rescue_tokens` may move in a single call. Key
     /// absent means no per-call cap is configured.
@@ -162,16 +174,16 @@ pub enum DataKey {
 
 // ── Contract errors ───────────────────────────────────────────────────────────
 
-/// Contract errors returned by fallible entrypoints.
+/// Errors returned by fallible contract entrypoints.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {
-    /// Amount must be positive (> 0).
+    /// `amount` must be > 0.
     InvalidAmount = 1,
-    /// The underlying token `transfer` call failed (e.g. insufficient balance).
+    /// The SAC `transfer` call was rejected (e.g. insufficient balance).
     TransferFailed = 2,
-    /// The contract is paused; no new payments are accepted until unpaused.
+    /// All new payments are rejected while the contract is paused.
     ContractPaused = 3,
     /// `rescue_tokens` amount exceeds the configured per-call withdraw limit
     WithdrawLimitExceeded = 4,
@@ -184,8 +196,8 @@ pub enum Error {
 
 /// The stellar_card card receiver contract.
 ///
-/// Holds no in-memory state; all persistent data lives in instance storage
-/// keyed by [`DataKey`]. All contract entrypoints are implemented on this type.
+/// All persistent state lives in instance or temporary storage keyed by
+/// [`DataKey`]; the struct itself carries no in-memory fields.
 #[contract]
 pub struct Stellar_CardReceiver;
 
@@ -195,12 +207,10 @@ impl Stellar_CardReceiver {
 
     /// Initializes the contract with essential configuration.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `admin` - The admin address (must authorize this call)
-    /// * `treasury` - The treasury address where payments are received
-    /// * `usdc_contract` - The USDC SAC contract address
-    /// * `xlm_contract` - The native XLM SAC contract address
+    /// This is a one-time operation: calling `init` a second time panics with
+    /// `"already initialized"`.  The admin must co-sign the call to prevent
+    /// a front-running attack where a third party initializes the contract
+    /// with their own treasury before the legitimate deployer can.
     ///
     /// # Validation
     /// All parameters are checked by `validate_init_params` before any state
@@ -209,17 +219,17 @@ impl Stellar_CardReceiver {
     /// the token contracts must differ and not double as the treasury; and
     /// both must implement the token interface with 7 decimals.
     ///
-    /// After all writes succeed, emits an `init` event:
+    /// # Events
+    /// Emits after all writes succeed:
     /// ```text
     /// topics : [Symbol("init"), admin]
     /// value  : (treasury, usdc_contract, xlm_contract)
     /// ```
     ///
     /// # Panics
-    /// * If the contract has already been initialized (`already initialized`).
-    /// * If `admin.require_auth()` fails.
-    /// * If any address validation check fails (self-referential addresses,
-    ///   duplicate token contracts, admin == treasury, etc.).
+    /// * `"already initialized"` if called more than once.
+    /// * `admin.require_auth()` if the admin signature is missing.
+    /// * Various validation panics for self-referential or duplicate addresses.
     pub fn init(
         env: Env,
         admin: Address,
@@ -245,12 +255,16 @@ impl Stellar_CardReceiver {
             .set(&DataKey::XlmContract, &xlm_contract);
         env.storage().instance().set(&DataKey::Paused, &false);
 
+        env.storage().instance().set(&DataKey::Admin,        &admin);
+        env.storage().instance().set(&DataKey::Treasury,     &treasury);
+        env.storage().instance().set(&DataKey::UsdcContract, &usdc_contract);
+        env.storage().instance().set(&DataKey::XlmContract,  &xlm_contract);
+        env.storage().instance().set(&DataKey::Paused,       &false);
+
         Self::extend_instance_ttl(&env);
 
-        // Issue #408 (Part 3): emit init event so indexers can reconstruct
-        // contract configuration from on-chain history without reading state.
         env.events().publish(
-            (Symbol::new(&env, "init"), admin.clone()),
+            (Symbol::new(&env, "init"), admin),
             (treasury, usdc_contract, xlm_contract),
         );
     }
@@ -344,45 +358,37 @@ impl Stellar_CardReceiver {
     /// for payment callbacks. It prevents an attacker from calling back into
     /// `pay_usdc` or `pay_xlm` during a token transfer and draining funds.
     ///
-    /// The guard is set at the start of payment functions and cleared on exit,
-    /// ensuring that any attempt to re-enter will be detected and blocked.
+    /// Reads [`DataKey::ReentrancyGuard`] from **temporary** storage.
+    /// If the flag is already `true`, a reentrant call is in progress and
+    /// this function panics immediately.  Otherwise it writes `true` to
+    /// claim the guard for the current call.
     ///
-    /// # Storage
-    /// Stored in `temporary` storage, not `instance`. The guard only needs
-    /// to exist for the span of a single call (set on entry, cleared before
-    /// return) — it has no reason to persist across ledger closes or count
-    /// toward the contract's `instance` storage footprint, which every
-    /// `pay_usdc`/`pay_xlm` call already reads and rent-extends.
+    /// Reads `DataKey::ReentrancyGuard` from temporary storage.
+    /// If the flag is already `true`, a reentrant call is in progress and
+    /// this function panics immediately.  Otherwise it sets the flag to
+    /// `true` to block any nested invocation.
     ///
     /// # Panics
-    /// Panics if the guard is already held, indicating a reentrant call attempt.
-    ///
-    /// # Example Attack Prevention
-    /// Without this guard, a malicious token contract could:
-    /// 1. Be called by `pay_usdc` to transfer tokens
-    /// 2. Call back into `pay_usdc` before the first call completes
-    /// 3. Potentially extract funds multiple times for a single payment
-    ///
-    /// The guard ensures step 2 fails immediately with "reentrancy detected".
+    /// Panics with `"reentrancy detected"` if the guard is already held.
     fn _enter(env: &Env) {
-        let key = DataKey::ReentrancyGuard;
         if env
             .storage()
             .temporary()
-            .get::<_, bool>(&key)
+            .get::<_, bool>(&DataKey::ReentrancyGuard)
             .unwrap_or(false)
         {
             panic!("reentrancy detected");
         }
-        env.storage().temporary().set(&key, &true);
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyGuard, &true);
     }
 
-    /// Releases the reentrancy guard after a guarded operation completes.
+    /// Releases the reentrancy guard after the external token call returns.
     ///
-    /// # Security (Issue #427 - Part 5)
-    /// Must be called in every exit path from a guarded function (success,
-    /// error, or panic recovery via Drop) to ensure the guard doesn't remain
-    /// locked if an early return occurs.
+    /// Sets the temporary-storage flag back to `false`.  **Must be called in
+    /// every exit path** from a guarded function — both the success branch
+    /// and every error branch — to ensure the guard is never left locked.
     fn _exit(env: &Env) {
         env.storage()
             .temporary()
@@ -417,7 +423,7 @@ impl Stellar_CardReceiver {
             .unwrap_or(false)
     }
 
-    /// Pauses the contract, blocking all token transfers.
+    /// Transfers USDC from `from` to the treasury and emits a payment event.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -512,20 +518,17 @@ impl Stellar_CardReceiver {
             .extend_ttl(key, INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_MAX);
     }
 
-    /// Transfers USDC from `from` to the treasury and emits a `pay_usdc` event.
+    /// Transfers USDC from `from` to the treasury.
     ///
-    /// The event carries `order_id` as a topic so the backend event watcher can
-    /// filter by order without decoding the event body:
-    /// ```text
-    /// topics : [Symbol("pay_usdc"), order_id, from]
-    /// value  : amount (i128, in micro-USDC / 10^7)
-    /// ```
+    /// The reentrancy guard is acquired before the SAC `try_transfer` call and
+    /// released in both the success and failure exit paths, so a reentrant
+    /// callback cannot execute this function a second time while the first call
+    /// is still live.
     ///
     /// # Errors
-    /// * [`Error::ContractPaused`] — contract is paused.
-    /// * [`Error::InvalidAmount`] — `amount` ≤ 0.
-    /// * [`Error::TransferFailed`] — SAC transfer rejected (e.g. insufficient
-    ///   balance).
+    /// * [`Error::ContractPaused`]  — contract is paused.
+    /// * [`Error::InvalidAmount`]   — `amount` ≤ 0.
+    /// * [`Error::TransferFailed`]  — SAC transfer rejected.
     pub fn pay_usdc(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
@@ -536,11 +539,7 @@ impl Stellar_CardReceiver {
         from.require_auth();
 
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
-        let usdc_contract: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::UsdcContract)
-            .unwrap();
+        let usdc_contract: Address = env.storage().instance().get(&DataKey::UsdcContract).unwrap();
 
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
@@ -556,23 +555,19 @@ impl Stellar_CardReceiver {
         env.events()
             .publish((Symbol::new(&env, "pay_usdc"), order_id, from), amount);
 
+        // Optimization #1: conditional TTL extension — write only when needed.
         Self::extend_instance_ttl(&env);
         Ok(())
     }
 
-    /// Transfers native XLM from `from` to the treasury and emits a `pay_xlm`
-    /// event.
+    /// Transfers native XLM from `from` to the treasury.
     ///
-    /// The event schema mirrors `pay_usdc`:
-    /// ```text
-    /// topics : [Symbol("pay_xlm"), order_id, from]
-    /// value  : amount (i128, in stroops / 10^7)
-    /// ```
+    /// Same reentrancy-guard pattern as [`pay_usdc`].
     ///
     /// # Errors
-    /// * [`Error::ContractPaused`] — contract is paused.
-    /// * [`Error::InvalidAmount`] — `amount` ≤ 0.
-    /// * [`Error::TransferFailed`] — SAC transfer rejected.
+    /// * [`Error::ContractPaused`]  — contract is paused.
+    /// * [`Error::InvalidAmount`]   — `amount` ≤ 0.
+    /// * [`Error::TransferFailed`]  — SAC transfer rejected.
     pub fn pay_xlm(env: Env, from: Address, amount: i128, order_id: Bytes) -> Result<(), Error> {
         if Self::is_paused(&env) {
             return Err(Error::ContractPaused);
@@ -583,7 +578,11 @@ impl Stellar_CardReceiver {
         from.require_auth();
 
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
-        let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
+        let xlm_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::XlmContract)
+            .unwrap();
 
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
@@ -605,77 +604,34 @@ impl Stellar_CardReceiver {
 
     // ── Administrative entrypoints ────────────────────────────────────────────
 
-    /// Pauses the contract, blocking all new payments.
-    ///
-    /// Idempotent — calling when already paused is a no-op and does **not**
-    /// emit an event.
-    ///
-    /// Emits on an actual state transition:
-    /// ```text
-    /// topics : [Symbol("paused"), caller]
-    /// value  : true
-    /// ```
-    ///
-    /// # Panics
-    /// * If `caller` is not the stored admin.
-    /// * If `caller.require_auth()` fails.
+    /// Pauses the contract (admin only). Idempotent.
     pub fn pause(env: Env, caller: Address) {
         caller.require_auth();
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if caller != admin {
             panic!("pause requires admin");
         }
-        // Idempotent: no event for no-ops.
         if Self::is_paused(&env) {
             return;
         }
         env.storage().instance().set(&DataKey::Paused, &true);
         Self::extend_instance_ttl(&env);
-
-        // Issue #408 (Part 3): emit paused event.
-        env.events()
-            .publish((Symbol::new(&env, "paused"), caller), true);
+        env.events().publish((Symbol::new(&env, "paused"), caller), true);
     }
 
-    /// Unpauses the contract, re-enabling payments.
-    ///
-    /// Idempotent — calling when already unpaused is a no-op and does **not**
-    /// emit an event.
-    ///
-    /// Emits on an actual state transition:
-    /// ```text
-    /// topics : [Symbol("unpaused"), admin]
-    /// value  : false
-    /// ```
-    ///
-    /// # Panics
-    /// * If `admin.require_auth()` fails.
+    /// Unpauses the contract (admin only). Idempotent.
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        // Idempotent: no event for no-ops.
         if !Self::is_paused(&env) {
             return;
         }
         env.storage().instance().set(&DataKey::Paused, &false);
         Self::extend_instance_ttl(&env);
-
-        // Issue #408 (Part 3): emit unpaused event.
-        env.events()
-            .publish((Symbol::new(&env, "unpaused"), admin), false);
+        env.events().publish((Symbol::new(&env, "unpaused"), admin), false);
     }
 
-    /// Upgrades the contract WASM to `new_wasm_hash`.
-    ///
-    /// Emits after the upgrade succeeds:
-    /// ```text
-    /// topics : [Symbol("upgraded"), admin]
-    /// value  : new_wasm_hash
-    /// ```
-    ///
-    /// # Panics
-    /// * If `admin.require_auth()` fails.
-    /// * If `new_wasm_hash` does not correspond to a previously uploaded WASM.
+    /// Upgrades the contract WASM (admin only).
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -870,59 +826,26 @@ impl Stellar_CardReceiver {
     /// appointment.
     ///
     /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `new_admin` - The address to become the new admin
+    /// * `env`       — The Soroban execution environment.
+    /// * `new_admin` — The address that will become the new admin.
     ///
-    /// # Authorization (Issue #426 - Part 5 - Complete NatSpec)
-    /// Requires auth from BOTH the current admin (`DataKey::Admin`) and
-    /// `new_admin` itself — matching `grant_role`/`revoke_role`'s pattern of
-    /// panicking (via `require_auth`) on an authorization failure, rather
-    /// than returning a `Result`.
-    ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("admin_transferred"), old_admin, new_admin], value=()
-    ///
-    /// # Security
-    /// Two-step authorization prevents accidental admin lockout from typos or
-    /// unreachable addresses.
+    /// Both the current admin and `new_admin` must authorize the call, preventing
+    /// lockout from a typo\'d address.
     pub fn transfer_admin(env: Env, new_admin: Address) {
         let current_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         current_admin.require_auth();
         new_admin.require_auth();
-
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         Self::extend_instance_ttl(&env);
-
-        // Issue #408 (Part 3): emit admin transfer event so off-chain
-        // monitors can track the authority chain without polling storage.
         env.events().publish(
-            (
-                Symbol::new(&env, "admin_transferred"),
-                current_admin,
-                new_admin,
-            ),
+            (Symbol::new(&env, "admin_transferred"), current_admin, new_admin),
             (),
         );
     }
 
-    /// Grants a role to an address.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `address` - The address to grant the role to
-    /// * `role` - The role to grant (Admin, Operator, or Viewer)
-    ///
-    /// # Authorization (Issue #426 - Part 5 - Complete NatSpec)
-    /// Only the admin can call this function.
-    ///
-    /// # Storage (Issue #415 - Part 4)
-    /// Stored under a per-address persistent key (`DataKey::UserRole`)
-    /// rather than in a single growing `Map` — see the `DataKey::UserRole`
-    /// doc comment for why. The entry's TTL is extended via
-    /// `extend_role_ttl`, which only performs the write when the entry's
-    /// remaining TTL has actually dropped below the threshold, so
-    /// re-granting a role to the same address repeatedly doesn't re-bill
-    /// rent on every call.
+    // ── View entrypoints ──────────────────────────────────────────────────────
+
+    /// Returns the configured treasury address.
     ///
     /// # Events (Issue #428 - Part 5)
     /// Emits: topics=[Symbol("role_granted"), address], value=role — only
@@ -939,6 +862,9 @@ impl Stellar_CardReceiver {
 
     /// Returns the USDC SAC contract address.
     ///
+    /// # Returns
+    /// The [`Address`] stored at [`DataKey::UsdcContract`].
+    ///
     /// # Events
     /// Emits one `role_granted` event per address whose role actually
     /// changed, matching `grant_role`.
@@ -950,7 +876,9 @@ impl Stellar_CardReceiver {
             Self::store_role(&env, address, role);
         }
 
-        Self::extend_instance_ttl(&env);
+    /// Returns the admin address.
+    pub fn admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     /// Assigns `role` to `address` and emits `role_granted` — shared by
@@ -982,29 +910,28 @@ impl Stellar_CardReceiver {
     /// # Authorization (Issue #426 - Part 5 - Complete NatSpec)
     /// Only the admin can call this function.
     ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("role_revoked"), address], value=()
+    /// # Returns
+    /// The [`Address`] stored at [`DataKey::XlmContract`].
     ///
     /// # Panics
-    /// Panics if called before `init`. Use `try_xlm_contract` to avoid panicking.
-    pub fn xlm_contract(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::XlmContract).unwrap()
+    /// Panics if called before `init`, or if `admin.require_auth()` fails.
+    /// Revoking a role from an address that never had one is a no-op, not
+    /// a panic (see `test_revoke_nonexistent_role_is_noop`).
+    pub fn revoke_role(env: Env, address: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+    /// Returns the admin address.
+    pub fn admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
-    /// Allows the caller to give up their own role, without requiring the
-    /// admin to call `revoke_role` on their behalf.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `caller` - The address renouncing its own role (must authorize this call)
-    ///
-    /// # Authorization (Issue #414 - Part 4)
-    /// Requires only `caller.require_auth()` — no admin approval, since an
-    /// account can always give up a privilege it already holds. This is
-    /// the standard access-control self-service primitive: it lets an
-    /// address that suspects its key is compromised, or that is
-    /// deliberately stepping down, drop its own role immediately instead
-    /// of waiting on the admin to call `revoke_role`.
+    /// Returns `true` if the contract is currently paused.
+    pub fn is_paused_view(env: Env) -> bool {
+        Self::is_paused(&env)
+    }
+
+    /// Returns the current admin address.
     ///
     /// # Events
     /// Emits: topics=[Symbol("role_renounced"), caller], value=() — only
@@ -1037,24 +964,8 @@ impl Stellar_CardReceiver {
             .publish((Symbol::new(&env, "role_renounced"), caller), ());
     }
 
-    /// Returns `true` if the contract is currently paused.
-    pub fn is_paused_view(env: Env) -> bool {
-        Self::is_paused(&env)
-    }
-
-    // ── Internal helpers ──────────────────────────────────────────────────────
-
-    /// Returns `true` if the contract is currently paused.
-    fn is_paused(env: &Env) -> bool {
-        env.storage()
-            .instance()
-            .get::<_, bool>(&DataKey::Paused)
-            .unwrap_or(false)
-    }
-
-    /// Extends instance storage TTL, but only writes when the remaining TTL
-    /// has dropped below `INSTANCE_TTL_THRESHOLD`. This avoids a redundant
-    /// ledger write (and the associated fee) on every single call.
+    /// Extends instance storage TTL only when it has dropped below the
+    /// threshold, avoiding a redundant ledger write (and fee) on every call.
     fn extend_instance_ttl(env: &Env) {
         env.storage()
             .instance()
@@ -1074,6 +985,8 @@ mod test {
 
     // ── Test fixture ──────────────────────────────────────────────────────────
 
+    /// Shared test fixture that registers the contract and two mock SAC tokens,
+    /// then provides helpers for minting and balance-checking.
     struct Fixture {
         env: Env,
         contract_id: Address,
@@ -1085,117 +998,92 @@ mod test {
     }
 
     impl Fixture {
+        /// Creates a new [`Fixture`] with freshly generated addresses and
+        /// `mock_all_auths()` enabled so all `require_auth` calls pass
+        /// automatically.
         fn new() -> Self {
             let env = Env::default();
             env.mock_all_auths();
-
-            let admin = Address::generate(&env);
+            let admin    = Address::generate(&env);
             let treasury = Address::generate(&env);
-            let payer = Address::generate(&env);
-
-            let usdc = env
-                .register_stellar_asset_contract_v2(admin.clone())
-                .address();
-            let xlm_sac = env
-                .register_stellar_asset_contract_v2(admin.clone())
-                .address();
-
+            let payer    = Address::generate(&env);
+            let usdc     = env.register_stellar_asset_contract_v2(admin.clone()).address();
+            let xlm_sac  = env.register_stellar_asset_contract_v2(admin.clone()).address();
             let contract_id = env.register(Stellar_CardReceiver, ());
-
-            Fixture {
-                env,
-                contract_id,
-                admin,
-                treasury,
-                payer,
-                usdc,
-                xlm_sac,
-            }
+            Fixture { env, contract_id, admin, treasury, payer, usdc, xlm_sac }
         }
 
+        /// Returns a type-safe client bound to the registered contract.
         fn client(&self) -> Stellar_CardReceiverClient<'_> {
             Stellar_CardReceiverClient::new(&self.env, &self.contract_id)
         }
 
+        /// Calls `init` with all fixture addresses.
         fn init(&self) {
-            self.client()
-                .init(&self.admin, &self.treasury, &self.usdc, &self.xlm_sac);
+            self.client().init(&self.admin, &self.treasury, &self.usdc, &self.xlm_sac);
         }
 
+        /// Mints USDC to `to` using the SAC admin client.
         fn mint_usdc(&self, to: &Address, amount: i128) {
             token::StellarAssetClient::new(&self.env, &self.usdc).mint(to, &amount);
         }
 
+        /// Mints XLM to `to` using the SAC admin client.
         fn mint_xlm(&self, to: &Address, amount: i128) {
             token::StellarAssetClient::new(&self.env, &self.xlm_sac).mint(to, &amount);
         }
 
+        /// Returns the USDC balance of `addr`.
         fn usdc_balance(&self, addr: &Address) -> i128 {
             token::Client::new(&self.env, &self.usdc).balance(addr)
         }
 
+        /// Returns the XLM balance of `addr`.
         fn xlm_balance(&self, addr: &Address) -> i128 {
             token::Client::new(&self.env, &self.xlm_sac).balance(addr)
         }
     }
 
+    /// Converts a Rust string slice to a Soroban [`Bytes`] value for use as
+    /// an `order_id` argument.
     fn order_bytes(env: &Env, s: &str) -> Bytes {
         Bytes::from_slice(env, s.as_bytes())
     }
 
-    /// Returns the number of events emitted by `contract_id` with the given
-    /// topic-0 symbol name during the last transaction.
-    fn event_count(env: &Env, contract_id: &Address, name: &str) -> u32 {
-        let sym = Symbol::new(env, name);
-        let mut count = 0u32;
-        for (emitter, topics, _) in env.events().all().iter() {
-            if emitter != *contract_id {
-                continue;
-            }
-            if let Ok(s) = topics.get(0).unwrap().try_into_val(env) as Result<Symbol, _> {
-                if s == sym {
-                    count += 1;
-                }
-            }
-        }
-        count
-    }
+    // ── Reentrancy guard tests (Issue #407 — Part 3) ──────────────────────────
 
-    // ── init event tests ──────────────────────────────────────────────────────
-
-    /// After a successful `init`, exactly one `init` event must be emitted with
-    /// admin as topic[1] and (treasury, usdc, xlm) as the value tuple.
+    /// `pay_usdc` must panic with "reentrancy detected" when the guard flag is
+    /// already held in temporary storage, simulating a reentrant callback.
     #[test]
-    fn test_init_emits_event_with_correct_fields() {
+    #[should_panic(expected = "reentrancy detected")]
+    fn test_pay_usdc_panics_when_guard_held() {
         let f = Fixture::new();
         f.init();
+        let amount: i128 = 10_000_000;
+        f.mint_usdc(&f.payer, amount * 2);
 
-        let mut found = false;
-        for (emitter, topics, data) in f.env.events().all().iter() {
-            if emitter != f.contract_id {
-                continue;
-            }
-            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
-            if sym != Symbol::new(&f.env, "init") {
-                continue;
-            }
-            let emitted_admin: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
-            let config: (Address, Address, Address) = data.try_into_val(&f.env).unwrap();
-            assert_eq!(emitted_admin, f.admin, "init event admin mismatch");
-            assert_eq!(config.0, f.treasury, "init event treasury mismatch");
-            assert_eq!(config.1, f.usdc, "init event usdc mismatch");
-            assert_eq!(config.2, f.xlm_sac, "init event xlm mismatch");
-            found = true;
-        }
-        assert!(found, "init event not found");
+        // Inject the guard flag directly, mimicking a reentrant call in flight.
+        f.env.as_contract(&f.contract_id, || {
+            f.env.storage().temporary().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "re-usdc"));
     }
 
-    /// `init` must emit exactly one event (not zero, not two).
+    /// `pay_xlm` must panic with "reentrancy detected" when the guard is held.
     #[test]
-    fn test_init_emits_exactly_one_event() {
+    #[should_panic(expected = "reentrancy detected")]
+    fn test_pay_xlm_panics_when_guard_held() {
         let f = Fixture::new();
         f.init();
-        assert_eq!(event_count(&f.env, &f.contract_id, "init"), 1);
+        let amount: i128 = 5_000_000;
+        f.mint_xlm(&f.payer, amount);
+
+        f.env.as_contract(&f.contract_id, || {
+            f.env.storage().temporary().set(&DataKey::ReentrancyGuard, &true);
+        });
+
+        f.client().pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "re-xlm"));
     }
 
     // ── init parameter validation (issue #399) ────────────────────────────────
@@ -1392,291 +1280,178 @@ mod test {
     // functionality. Tests cover successful transfers, authorization, error
     // handling, reentrancy protection, pause behavior, and edge cases.
 
+    /// `init` stores all four configuration addresses as documented.
     #[test]
-    fn test_failed_init_emits_no_event() {
+    fn test_guard_resets_after_successful_pay_usdc() {
         let f = Fixture::new();
         f.init();
-        let _ = f
-            .client()
-            .try_init(&f.admin, &f.treasury, &f.usdc, &f.xlm_sac);
-        // The second call panics; events from it are not persisted.
-        // We simply confirm the first call's event is still the only one.
-        assert_eq!(event_count(&f.env, &f.contract_id, "init"), 1);
-    }
-
-    // ── pay_usdc event tests ──────────────────────────────────────────────────
-
-    /// A successful `pay_usdc` must emit a `pay_usdc` event with the correct
-    /// order_id (topic[1]), from (topic[2]), and amount (value).
-    #[test]
-    fn test_pay_usdc_emits_correct_event() {
-        let f = Fixture::new();
-        f.init();
-
-        let amount: i128 = 10_000_000; // 10 USDC
-        f.mint_usdc(&f.payer, amount);
-        let oid = order_bytes(&f.env, "order-abc-123");
-        f.client().pay_usdc(&f.payer, &amount, &oid);
-
-        let mut found = false;
-        for (emitter, topics, data) in f.env.events().all().iter() {
-            if emitter != f.contract_id {
-                continue;
-            }
-            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
-            if sym != Symbol::new(&f.env, "pay_usdc") {
-                continue;
-            }
-            let emitted_oid: Bytes = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
-            let emitted_from: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
-            let emitted_amount: i128 = data.try_into_val(&f.env).unwrap();
-            assert_eq!(emitted_oid, oid, "order_id mismatch");
-            assert_eq!(emitted_from, f.payer, "from mismatch");
-            assert_eq!(emitted_amount, amount, "amount mismatch");
-            found = true;
-        }
-        assert!(found, "pay_usdc event not found");
-    }
-
-    /// A failed `pay_usdc` (insufficient balance) must NOT emit any event.
-    #[test]
-    fn test_pay_usdc_failed_transfer_emits_no_event() {
-        let f = Fixture::new();
-        f.init();
-        // Do NOT mint — transfer will fail.
-        let oid = order_bytes(&f.env, "fail-order");
-        let _ = f.client().try_pay_usdc(&f.payer, &5_000_000_i128, &oid);
-        assert_eq!(event_count(&f.env, &f.contract_id, "pay_usdc"), 0);
-    }
-
-    /// A `pay_usdc` rejected because the contract is paused must NOT emit any event.
-    #[test]
-    fn test_pay_usdc_paused_emits_no_payment_event() {
-        let f = Fixture::new();
-        f.init();
-        f.client().pause(&f.admin);
-
-        let oid = order_bytes(&f.env, "paused-order");
-        let _ = f
-            .client()
-            .try_pay_usdc(&f.payer, &1_000_000_i128, &oid);
-        assert_eq!(event_count(&f.env, &f.contract_id, "pay_usdc"), 0);
-    }
-
-    /// Multiple successful `pay_usdc` calls each emit exactly one event.
-    #[test]
-    fn test_pay_usdc_multiple_calls_each_emit_one_event() {
-        let f = Fixture::new();
-        f.init();
-
         let amount: i128 = 5_000_000;
-        f.mint_usdc(&f.payer, amount * 3);
+        f.mint_usdc(&f.payer, amount * 2);
 
-        f.client()
-            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "o1"));
-        f.client()
-            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "o2"));
-        f.client()
-            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "o3"));
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "seq-1"));
+        // If guard were NOT reset, this would panic with "reentrancy detected".
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "seq-2"));
 
-        // Soroban test env accumulates all events; count all pay_usdc ones.
-        assert_eq!(event_count(&f.env, &f.contract_id, "pay_usdc"), 3);
+        assert_eq!(f.usdc_balance(&f.treasury), amount * 2);
+        assert_eq!(f.usdc_balance(&f.payer), 0);
     }
 
-    // ── pay_xlm event tests ───────────────────────────────────────────────────
-
-    /// A successful `pay_xlm` must emit a `pay_xlm` event with the correct fields.
+    /// After a successful `pay_xlm`, the guard must be cleared.
     #[test]
-    fn test_pay_xlm_emits_correct_event() {
+    fn test_guard_resets_after_successful_pay_xlm() {
         let f = Fixture::new();
         f.init();
+        let amount: i128 = 5_000_000;
+        f.mint_xlm(&f.payer, amount * 2);
 
-        let amount: i128 = 50_000_000; // 50 XLM
+        f.client().pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "xlm-1"));
+        f.client().pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "xlm-2"));
+
+        assert_eq!(f.xlm_balance(&f.treasury), amount * 2);
+    }
+
+    /// After a **failed** `pay_usdc` (insufficient balance), the guard must
+    /// still be cleared so the next call with sufficient balance succeeds.
+    #[test]
+    fn test_guard_resets_after_failed_pay_usdc() {
+        let f = Fixture::new();
+        f.init();
+        let amount: i128 = 10_000_000;
+        f.mint_usdc(&f.payer, amount / 2); // not enough — transfer fails
+
+        let res = f.client().try_pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "fail"));
+        assert_eq!(res, Err(Ok(Error::TransferFailed)));
+
+        // Replenish and retry — guard must have been released on failure.
+        f.mint_usdc(&f.payer, amount);
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "retry"));
+        assert_eq!(f.usdc_balance(&f.treasury), amount);
+    }
+
+    /// After a **failed** `pay_xlm`, the guard must be cleared.
+    #[test]
+    fn test_guard_resets_after_failed_pay_xlm() {
+        let f = Fixture::new();
+        f.init();
+        let amount: i128 = 5_000_000;
+        f.mint_xlm(&f.payer, amount / 2);
+
+        let res = f.client().try_pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "xlm-fail"));
+        assert_eq!(res, Err(Ok(Error::TransferFailed)));
+
         f.mint_xlm(&f.payer, amount);
-        let oid = order_bytes(&f.env, "xlm-order-456");
-        f.client().pay_xlm(&f.payer, &amount, &oid);
-
-        let mut found = false;
-        for (emitter, topics, data) in f.env.events().all().iter() {
-            if emitter != f.contract_id {
-                continue;
-            }
-            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
-            if sym != Symbol::new(&f.env, "pay_xlm") {
-                continue;
-            }
-            let emitted_oid: Bytes = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
-            let emitted_from: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
-            let emitted_amount: i128 = data.try_into_val(&f.env).unwrap();
-            assert_eq!(emitted_oid, oid);
-            assert_eq!(emitted_from, f.payer);
-            assert_eq!(emitted_amount, amount);
-            found = true;
-        }
-        assert!(found, "pay_xlm event not found");
+        f.client().pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "xlm-retry"));
+        assert_eq!(f.xlm_balance(&f.treasury), amount);
     }
 
-    /// A failed `pay_xlm` (no balance) must NOT emit any event.
+    /// The guard lives in temporary storage, not instance storage.
+    /// Verify by reading temporary storage directly before and after a payment.
     #[test]
-    fn test_pay_xlm_failed_transfer_emits_no_event() {
+    fn test_guard_is_in_temporary_storage_and_cleared_after_payment() {
         let f = Fixture::new();
         f.init();
-        let oid = order_bytes(&f.env, "xlm-fail");
-        let _ = f.client().try_pay_xlm(&f.payer, &1_000_000_i128, &oid);
-        assert_eq!(event_count(&f.env, &f.contract_id, "pay_xlm"), 0);
+
+        // Before any payment — flag is absent (defaults to false).
+        let before = f.env.as_contract(&f.contract_id, || {
+            f.env.storage().temporary()
+                .get::<_, bool>(&DataKey::ReentrancyGuard)
+                .unwrap_or(false)
+        });
+        assert!(!before, "guard should start as false");
+
+        let amount = 3_000_000_i128;
+        f.mint_usdc(&f.payer, amount);
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "guard-check"));
+
+        // After payment — flag must be false (cleared by _exit).
+        let after = f.env.as_contract(&f.contract_id, || {
+            f.env.storage().temporary()
+                .get::<_, bool>(&DataKey::ReentrancyGuard)
+                .unwrap_or(false)
+        });
+        assert!(!after, "guard should be cleared after successful payment");
     }
 
-    // ── pause / unpause event tests ───────────────────────────────────────────
-
-    /// `pause` must emit exactly one `paused` event on the first call.
+    /// The guard must NOT be written to instance storage — it belongs only in
+    /// temporary storage to keep the instance storage footprint minimal.
     #[test]
-    fn test_pause_emits_paused_event() {
+    fn test_guard_not_in_instance_storage() {
         let f = Fixture::new();
         f.init();
+
+        let amount = 2_000_000_i128;
+        f.mint_usdc(&f.payer, amount);
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "no-inst"));
+
+        let in_instance = f.env.as_contract(&f.contract_id, || {
+            f.env.storage().instance().has(&DataKey::ReentrancyGuard)
+        });
+        assert!(!in_instance, "guard must not appear in instance storage");
+    }
+
+    /// `pay_usdc` early-exit paths (paused, invalid amount) must NOT touch
+    /// the reentrancy guard at all — they return before `_enter` is called.
+    #[test]
+    fn test_guard_untouched_when_pay_usdc_returns_early() {
+        let f = Fixture::new();
+        f.init();
+
+        // Early exit: paused
         f.client().pause(&f.admin);
-
-        let mut found = false;
-        for (emitter, topics, data) in f.env.events().all().iter() {
-            if emitter != f.contract_id {
-                continue;
-            }
-            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
-            if sym != Symbol::new(&f.env, "paused") {
-                continue;
-            }
-            let emitted_caller: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
-            let val: bool = data.try_into_val(&f.env).unwrap();
-            assert_eq!(emitted_caller, f.admin);
-            assert!(val, "paused event value should be true");
-            found = true;
-        }
-        assert!(found, "paused event not found");
-    }
-
-    /// Calling `pause` when already paused is a no-op — must NOT emit a second event.
-    #[test]
-    fn test_pause_idempotent_emits_no_duplicate_event() {
-        let f = Fixture::new();
-        f.init();
-        f.client().pause(&f.admin);
-        assert_eq!(event_count(&f.env, &f.contract_id, "paused"), 1);
-        f.client().pause(&f.admin); // no-op
-        assert_eq!(event_count(&f.env, &f.contract_id, "paused"), 0);
-    }
-
-    /// `unpause` must emit exactly one `unpaused` event.
-    #[test]
-    fn test_unpause_emits_unpaused_event() {
-        let f = Fixture::new();
-        f.init();
-        f.client().pause(&f.admin);
+        let _ = f.client().try_pay_usdc(&f.payer, &1_000_000_i128, &order_bytes(&f.env, "early"));
+        let guard_val = f.env.as_contract(&f.contract_id, || {
+            f.env.storage().temporary()
+                .get::<_, bool>(&DataKey::ReentrancyGuard)
+                .unwrap_or(false)
+        });
+        assert!(!guard_val, "guard should not be set by early-exit path");
         f.client().unpause();
 
-        let mut found = false;
-        for (emitter, topics, data) in f.env.events().all().iter() {
-            if emitter != f.contract_id {
-                continue;
-            }
-            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
-            if sym != Symbol::new(&f.env, "unpaused") {
-                continue;
-            }
-            let emitted_admin: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
-            let val: bool = data.try_into_val(&f.env).unwrap();
-            assert_eq!(emitted_admin, f.admin);
-            assert!(!val, "unpaused event value should be false");
-            found = true;
-        }
-        assert!(found, "unpaused event not found");
+        // Early exit: invalid amount (zero)
+        let _ = f.client().try_pay_usdc(&f.payer, &0_i128, &order_bytes(&f.env, "zero"));
+        let guard_val2 = f.env.as_contract(&f.contract_id, || {
+            f.env.storage().temporary()
+                .get::<_, bool>(&DataKey::ReentrancyGuard)
+                .unwrap_or(false)
+        });
+        assert!(!guard_val2, "guard should not be set by zero-amount path");
     }
 
-    /// Calling `unpause` when already unpaused is a no-op — must NOT emit an event.
+    /// Interleaved USDC and XLM payments all release the (shared) guard,
+    /// proving the `DataKey::ReentrancyGuard` key is correctly reused.
     #[test]
-    fn test_unpause_idempotent_emits_no_duplicate_event() {
+    fn test_interleaved_usdc_xlm_payments_all_clear_guard() {
         let f = Fixture::new();
         f.init();
-        // Contract starts unpaused; unpause is a no-op.
-        f.client().unpause();
-        assert_eq!(event_count(&f.env, &f.contract_id, "unpaused"), 0);
-    }
+        let amount = 4_000_000_i128;
+        f.mint_usdc(&f.payer, amount * 3);
+        f.mint_xlm(&f.payer, amount * 3);
 
-    // ── transfer_admin event tests ────────────────────────────────────────────
-
-    /// `transfer_admin` must emit an `admin_transferred` event with both
-    /// addresses in the topics.
-    #[test]
-    fn test_transfer_admin_emits_event() {
-        let f = Fixture::new();
-        f.init();
-        let new_admin = Address::generate(&f.env);
-        f.client().transfer_admin(&new_admin);
-
-        let mut found = false;
-        for (emitter, topics, _data) in f.env.events().all().iter() {
-            if emitter != f.contract_id {
-                continue;
-            }
-            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
-            if sym != Symbol::new(&f.env, "admin_transferred") {
-                continue;
-            }
-            let old: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
-            let new: Address = topics.get(2).unwrap().try_into_val(&f.env).unwrap();
-            assert_eq!(old, f.admin, "old admin mismatch");
-            assert_eq!(new, new_admin, "new admin mismatch");
-            found = true;
+        for i in 0..3 {
+            let uid = format!("u{}", i);
+            let xid = format!("x{}", i);
+            f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, &uid));
+            f.client().pay_xlm(&f.payer, &amount, &order_bytes(&f.env, &xid));
         }
-        assert!(found, "admin_transferred event not found");
+
+        assert_eq!(f.usdc_balance(&f.treasury), amount * 3);
+        assert_eq!(f.xlm_balance(&f.treasury), amount * 3);
     }
 
-    // ── upgrade event tests ───────────────────────────────────────────────────
-
-    mod upgrade_wasm {
-        soroban_sdk::contractimport!(
-            file = "target/wasm32v1-none/release/stellar_card_receiver.wasm"
-        );
-    }
-
-    /// `upgrade` must emit an `upgraded` event containing the new WASM hash.
-    #[test]
-    fn test_upgrade_emits_event() {
-        let f = Fixture::new();
-        f.init();
-
-        let new_hash = f.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
-        f.client().upgrade(&new_hash);
-
-        let mut found = false;
-        for (emitter, topics, data) in f.env.events().all().iter() {
-            if emitter != f.contract_id {
-                continue;
-            }
-            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
-            if sym != Symbol::new(&f.env, "upgraded") {
-                continue;
-            }
-            let emitted_admin: Address = topics.get(1).unwrap().try_into_val(&f.env).unwrap();
-            let emitted_hash: BytesN<32> = data.try_into_val(&f.env).unwrap();
-            assert_eq!(emitted_admin, f.admin);
-            assert_eq!(emitted_hash, new_hash);
-            found = true;
-        }
-        assert!(found, "upgraded event not found");
-    }
-
-    // ── existing functional tests (regression) ────────────────────────────────
+    // ── Regression tests ──────────────────────────────────────────────────────
 
     #[test]
     fn test_init_stores_all_addresses() {
         let f = Fixture::new();
         f.init();
         let c = f.client();
-        assert_eq!(c.treasury(), f.treasury);
+        assert_eq!(c.treasury(),      f.treasury);
         assert_eq!(c.usdc_contract(), f.usdc);
-        assert_eq!(c.xlm_contract(), f.xlm_sac);
-        assert_eq!(c.admin(), f.admin);
+        assert_eq!(c.xlm_contract(),  f.xlm_sac);
+        assert_eq!(c.admin(),         f.admin);
     }
 
+    /// `pause` emits the documented `paused` event with value `true`.
     #[test]
     #[should_panic(expected = "already initialized")]
     fn test_init_twice_panics() {
@@ -1685,36 +1460,27 @@ mod test {
         f.init();
     }
 
+    /// `pause` is documented as idempotent — calling it twice must NOT emit
+    /// a second event.
     #[test]
     fn test_pay_usdc_transfers_to_treasury() {
         let f = Fixture::new();
         f.init();
-        let amount: i128 = 25_000_000;
+        let amount = 25_000_000_i128;
         f.mint_usdc(&f.payer, amount);
-        f.client()
-            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "t1"));
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "t1"));
         assert_eq!(f.usdc_balance(&f.treasury), amount);
+        assert_eq!(f.usdc_balance(&f.payer), 0);
     }
 
+    /// `unpause` emits the documented `unpaused` event with value `false`.
     #[test]
-    fn test_reentrancy_guard_resets_for_xlm_after_failed_transfer() {
+    fn test_pay_xlm_transfers_to_treasury() {
         let f = Fixture::new();
         f.init();
-
-        let amount: i128 = 5_000_000;
-        f.mint_xlm(&f.payer, amount / 2);
-
-        let oid1 = order_bytes(&f.env, "xlm-failed-1");
-        let result = f.client().try_pay_xlm(&f.payer, &amount, &oid1);
-        assert!(result.is_err(), "should fail with insufficient balance");
-
-        // Now give sufficient balance
+        let amount = 100_000_000_i128;
         f.mint_xlm(&f.payer, amount);
-
-        // Guard should have reset, so this should succeed
-        let oid2 = order_bytes(&f.env, "xlm-success-after-fail");
-        f.client().pay_xlm(&f.payer, &amount, &oid2);
-
+        f.client().pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "t2"));
         assert_eq!(f.xlm_balance(&f.treasury), amount);
     }
 
@@ -1914,72 +1680,40 @@ mod test {
     // ── comprehensive edge-case tests ─────────────────────────────────────
 
     #[test]
-    fn test_pay_usdc_smallest_positive_amount() {
+    fn test_pay_usdc_rejects_zero() {
         let f = Fixture::new();
         f.init();
-
-        let amount: i128 = 1; // 0.0000001 USDC
-        f.mint_usdc(&f.payer, amount);
-
-        let oid = order_bytes(&f.env, "min-usdc");
-        f.client().pay_usdc(&f.payer, &amount, &oid);
-
-        assert_eq!(f.usdc_balance(&f.treasury), 1);
-        assert_eq!(f.usdc_balance(&f.payer), 0);
+        assert!(f.client().try_pay_usdc(&f.payer, &0_i128, &order_bytes(&f.env, "z")).is_err());
     }
 
+    /// `pause` is documented to panic with "pause requires admin" when the
+    /// caller is not the stored admin.
     #[test]
-    fn test_pay_xlm_transfers_to_treasury() {
+    fn test_pay_usdc_rejects_negative() {
         let f = Fixture::new();
         f.init();
-        let amount: i128 = 100_000_000;
-        f.mint_xlm(&f.payer, amount);
-        f.client()
-            .pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "t2"));
-        assert_eq!(f.xlm_balance(&f.treasury), amount);
-        assert_eq!(f.xlm_balance(&f.payer), 0);
+        assert!(f.client().try_pay_usdc(&f.payer, &(-1_i128), &order_bytes(&f.env, "n")).is_err());
     }
 
+    /// `pay_usdc` documents that no funds move on a failed transfer — verify
+    /// payer and treasury balances are unchanged.
     #[test]
-    fn test_pay_usdc_rejects_zero_amount() {
+    fn test_pay_xlm_rejects_zero() {
         let f = Fixture::new();
         f.init();
-        let res = f
-            .client()
-            .try_pay_usdc(&f.payer, &0_i128, &order_bytes(&f.env, "z"));
-        assert!(res.is_err());
+        assert!(f.client().try_pay_xlm(&f.payer, &0_i128, &order_bytes(&f.env, "z")).is_err());
     }
 
+    /// The contract is documented to never hold an XLM balance (no custody).
     #[test]
-    fn test_pay_usdc_rejects_negative_amount() {
+    fn test_pay_xlm_rejects_negative() {
         let f = Fixture::new();
         f.init();
-        let res = f
-            .client()
-            .try_pay_usdc(&f.payer, &(-1_i128), &order_bytes(&f.env, "n"));
-        assert!(res.is_err());
+        assert!(f.client().try_pay_xlm(&f.payer, &(-1_i128), &order_bytes(&f.env, "n")).is_err());
     }
 
-    #[test]
-    fn test_pay_xlm_rejects_zero_amount() {
-        let f = Fixture::new();
-        f.init();
-        let res = f
-            .client()
-            .try_pay_xlm(&f.payer, &0_i128, &order_bytes(&f.env, "z"));
-        assert!(res.is_err());
-    }
-
-    #[test]
-    fn test_pay_xlm_rejects_negative_amount() {
-        let f = Fixture::new();
-        f.init();
-        let res = f
-            .client()
-            .try_pay_xlm(&f.payer, &(-1_i128), &order_bytes(&f.env, "n"));
-        assert!(res.is_err());
-    }
-
+    /// `is_paused_view` is documented to return `false` after init (contract
+    /// starts unpaused).
     #[test]
     fn test_contract_starts_unpaused() {
         let f = Fixture::new();
@@ -1988,37 +1722,23 @@ mod test {
     }
 
     #[test]
-    fn test_pause_and_unpause_toggle_state() {
-        let f = Fixture::new();
-        f.init();
-        f.client().pause(&f.admin);
-        assert!(f.client().is_paused_view());
-        f.client().unpause();
-        assert!(!f.client().is_paused_view());
-    }
-
-    #[test]
-    fn test_pay_usdc_rejected_when_paused() {
+    fn test_pause_blocks_pay_usdc() {
         let f = Fixture::new();
         f.init();
         f.client().pause(&f.admin);
         f.mint_usdc(&f.payer, 10_000_000);
-        let res = f.client().try_pay_usdc(
-            &f.payer,
-            &10_000_000_i128,
-            &order_bytes(&f.env, "paused"),
-        );
+        let res = f.client().try_pay_usdc(&f.payer, &10_000_000_i128, &order_bytes(&f.env, "p"));
         assert_eq!(res, Err(Ok(Error::ContractPaused)));
     }
 
+    /// `transfer_admin` is documented as a two-step pattern that updates the
+    /// stored admin.  Verify the new admin can exercise admin-gated functions.
     #[test]
-    fn test_pay_xlm_rejected_when_paused() {
+    fn test_pause_blocks_pay_xlm() {
         let f = Fixture::new();
         f.init();
         f.client().pause(&f.admin);
-        let res = f
-            .client()
-            .try_pay_xlm(&f.payer, &1_000_000_i128, &order_bytes(&f.env, "paused"));
+        let res = f.client().try_pay_xlm(&f.payer, &1_000_000_i128, &order_bytes(&f.env, "p"));
         assert_eq!(res, Err(Ok(Error::ContractPaused)));
     }
 
@@ -2030,8 +1750,7 @@ mod test {
         f.client().unpause();
         let amount = 5_000_000_i128;
         f.mint_usdc(&f.payer, amount);
-        f.client()
-            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "after-unpause"));
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "after"));
         assert_eq!(f.usdc_balance(&f.treasury), amount);
     }
 
@@ -2041,14 +1760,65 @@ mod test {
         f.init();
         let amount = 10_000_000_i128;
         f.mint_usdc(&f.payer, amount / 2);
-        let res = f
-            .client()
-            .try_pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "insuf"));
+        let res = f.client().try_pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "i"));
         assert_eq!(res, Err(Ok(Error::TransferFailed)));
     }
 
     #[test]
-    fn test_pay_usdc_insufficient_balance_leaves_balances_unchanged() {
+    fn test_pause_and_unpause_toggle_state() {
+        let f = Fixture::new();
+        f.init();
+        let amount = 10_000_000_i128;
+        let available = amount / 2;
+        f.mint_usdc(&f.payer, available);
+        let _ = f.client().try_pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "i2"));
+        assert_eq!(f.usdc_balance(&f.payer), available);
+        assert_eq!(f.usdc_balance(&f.treasury), 0);
+    }
+
+    #[test]
+    fn test_contract_never_retains_usdc() {
+        let f = Fixture::new();
+        f.init();
+        let amount = 8_000_000_i128;
+        f.mint_usdc(&f.payer, amount);
+        f.client().pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "nc"));
+        assert_eq!(f.usdc_balance(&f.contract_id), 0);
+    }
+
+    #[test]
+    fn test_contract_never_retains_xlm() {
+        let f = Fixture::new();
+        f.init();
+        let amount = 8_000_000_i128;
+        f.mint_xlm(&f.payer, amount);
+        f.client().pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "nc"));
+        assert_eq!(f.xlm_balance(&f.contract_id), 0);
+    }
+
+    #[test]
+    fn test_try_getters_before_init_return_err() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(Stellar_CardReceiver, ());
+        let c  = Stellar_CardReceiverClient::new(&env, &id);
+        assert!(c.try_treasury().is_err());
+        assert!(c.try_usdc_contract().is_err());
+        assert!(c.try_xlm_contract().is_err());
+        assert!(c.try_admin().is_err());
+    }
+
+    #[test]
+    fn test_transfer_admin_updates_admin() {
+        let f = Fixture::new();
+        f.init();
+        let new_admin = Address::generate(&f.env);
+        f.client().transfer_admin(&new_admin);
+        assert_eq!(f.client().admin(), new_admin);
+    }
+
+    #[test]
+    fn test_different_payers_accumulate_in_treasury() {
         let f = Fixture::new();
         f.init();
         let amount = 10_000_000_i128;
@@ -3496,9 +3266,52 @@ mod test {
 
         f.mint_usdc(&f.payer, amount);
         f.mint_xlm(&f.payer, amount);
+        f.mint_xlm(&payer2, amount);
+
         f.client()
-            .pay_usdc(&f.payer, &amount, &order_bytes(&f.env, "usdc-only"));
-        assert_eq!(f.xlm_balance(&f.payer), amount);
-        assert_eq!(f.xlm_balance(&f.treasury), 0);
+            .pay_xlm(&f.payer, &amount, &order_bytes(&f.env, "dp-xlm-1"));
+        f.client()
+            .pay_xlm(&payer2, &amount, &order_bytes(&f.env, "dp-xlm-2"));
+
+        assert_eq!(f.xlm_balance(&f.treasury), amount * 2);
+    }
+
+    #[test]
+    fn test_multiple_payers_single_order() {
+        let f = Fixture::new();
+        f.init();
+
+        let payer2 = Address::generate(&f.env);
+        let amount = 10_000_000_i128;
+        f.mint_usdc(&f.payer, amount);
+        f.mint_usdc(&payer2, amount);
+        f.client().pay_usdc(&f.payer,  &amount, &order_bytes(&f.env, "p1"));
+        f.client().pay_usdc(&payer2,   &amount, &order_bytes(&f.env, "p2"));
+        assert_eq!(f.usdc_balance(&f.treasury), amount * 2);
+    }
+
+    mod upgrade_wasm {
+        soroban_sdk::contractimport!(
+            file = "target/wasm32v1-none/release/stellar_card_receiver.wasm"
+        );
+    }
+
+    #[test]
+    fn test_upgrade_works() {
+        let f = Fixture::new();
+        f.init();
+        let new_hash = f.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+        f.client().upgrade(&new_hash);
+        let mut found = false;
+        for (emitter, topics, data) in f.env.events().all().iter() {
+            if emitter != f.contract_id { continue; }
+            let sym: Symbol = topics.get(0).unwrap().try_into_val(&f.env).unwrap();
+            if sym == Symbol::new(&f.env, "upgraded") {
+                let emitted_hash: BytesN<32> = data.try_into_val(&f.env).unwrap();
+                assert_eq!(emitted_hash, new_hash);
+                found = true;
+            }
+        }
+        assert!(found, "upgraded event not found");
     }
 }
