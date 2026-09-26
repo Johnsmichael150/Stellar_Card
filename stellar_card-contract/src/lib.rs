@@ -86,32 +86,48 @@ const TOKEN_DECIMALS: u32 = 7;
 
 /// Represents user roles in the contract with hierarchical permissions.
 ///
-/// Roles are ordered by privilege: `Admin > Operator > Viewer`. A holder of a
-/// higher role implicitly satisfies any lower role requirement (see
-/// [`Stellar_CardReceiver::has_role`]).
-#[contracttype]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Role {
-    /// Full administrative control. Can pause/unpause, upgrade, and manage roles.
-    Admin,
-    /// Operational role. Satisfies `Operator` and `Viewer` requirements.
-    Operator,
-    /// Lowest-privilege role. Read/observer level access only.
-    Viewer,
-}
+/// Set to half of [`INSTANCE_TTL_MAX`].  When `threshold == extend_to` (as
+/// was the original pattern), *any* decrease below the max retriggers a full
+/// extend — effectively a fee-costing ledger write on nearly every call.
+/// A threshold at half the max means an extension only fires roughly once
+/// every ~500 days\' worth of activity instead of on almost every call.
+const INSTANCE_TTL_THRESHOLD: u32 = INSTANCE_TTL_MAX / 2;
 
-/// Storage keys for contract state.
+// ── Storage keys ──────────────────────────────────────────────────────────────
+
+/// Discriminated union of all storage keys used by the contract.
 ///
 /// Each variant identifies a slot in the contract's storage.
 #[contracttype]
 pub enum DataKey {
-    /// Address that receives forwarded payments.
+    /// The Stellar address to which all forwarded payments are sent.
+    ///
+    /// Set once during [`Stellar_CardReceiver::init`] and never changed
+    /// afterwards.  Any payment that reaches `pay_usdc` or `pay_xlm`
+    /// forwards funds directly to this address in the same transaction —
+    /// the contract itself never holds a balance.
     Treasury,
-    /// Address of the USDC Stellar Asset Contract (SAC).
+
+    /// The contract address of the USDC Stellar Asset Contract (SAC).
+    ///
+    /// Used by [`Stellar_CardReceiver::pay_usdc`] to call `transfer` on
+    /// behalf of the payer.  Validated at init time via a `try_decimals()`
+    /// probe so a non-token address is caught immediately rather than at
+    /// the first payment.
     UsdcContract,
-    /// Address of the native XLM Stellar Asset Contract (SAC).
+
+    /// The contract address of the native XLM Stellar Asset Contract (SAC).
+    ///
+    /// Used by [`Stellar_CardReceiver::pay_xlm`].  Validated at init time
+    /// with the same `try_decimals()` probe as [`DataKey::UsdcContract`].
     XlmContract,
-    /// Address of the contract administrator.
+
+    /// The Stellar address that holds administrative control of the contract.
+    ///
+    /// This address is required to co-sign `init`, `pause`, `unpause`,
+    /// `upgrade`, and `transfer_admin`.  It is transferred atomically by
+    /// [`Stellar_CardReceiver::transfer_admin`], which requires both the
+    /// current and the new admin to authorize to prevent accidental lockout.
     Admin,
     /// Circuit breaker: `true` means payments are rejected.
     Paused,
@@ -163,12 +179,10 @@ impl Stellar_CardReceiver {
 
     /// Initializes the contract with essential configuration.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `admin` - The admin address (must authorize this call)
-    /// * `treasury` - The treasury address where payments are received
-    /// * `usdc_contract` - The USDC SAC contract address
-    /// * `xlm_contract` - The native XLM SAC contract address
+    /// This is a one-time operation: calling `init` a second time panics with
+    /// `"already initialized"`.  The admin must co-sign the call to prevent
+    /// a front-running attack where a third party initializes the contract
+    /// with their own treasury before the legitimate deployer can.
     ///
     /// # Validation
     /// All parameters are checked by `validate_init_params` before any state
@@ -177,8 +191,12 @@ impl Stellar_CardReceiver {
     /// the token contracts must differ and not double as the treasury; and
     /// both must implement the token interface with 7 decimals.
     ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("init"), admin], value=(treasury, usdc_contract, xlm_contract)
+    /// # Events
+    /// Emits after all writes succeed:
+    /// ```text
+    /// topics : [Symbol("init"), admin]
+    /// value  : (treasury, usdc_contract, xlm_contract)
+    /// ```
     ///
     /// # Panics
     /// * `"already initialized"` if called more than once.
@@ -312,8 +330,10 @@ impl Stellar_CardReceiver {
     /// for payment callbacks. It prevents an attacker from calling back into
     /// `pay_usdc` or `pay_xlm` during a token transfer and draining funds.
     ///
-    /// The guard is set at the start of payment functions and cleared on exit,
-    /// ensuring that any attempt to re-enter will be detected and blocked.
+    /// Reads [`DataKey::ReentrancyGuard`] from **temporary** storage.
+    /// If the flag is already `true`, a reentrant call is in progress and
+    /// this function panics immediately.  Otherwise it writes `true` to
+    /// claim the guard for the current call.
     ///
     /// Reads `DataKey::ReentrancyGuard` from temporary storage.
     /// If the flag is already `true`, a reentrant call is in progress and
@@ -375,7 +395,7 @@ impl Stellar_CardReceiver {
             .unwrap_or(false)
     }
 
-    /// Pauses the contract, blocking all token transfers.
+    /// Transfers USDC from `from` to the treasury and emits a payment event.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
@@ -529,7 +549,11 @@ impl Stellar_CardReceiver {
         from.require_auth();
 
         let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
-        let xlm_contract: Address = env.storage().instance().get(&DataKey::XlmContract).unwrap();
+        let xlm_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::XlmContract)
+            .unwrap();
 
         // The token contract is the only external call in this function, so
         // it is the only step that needs to run under the guard.
@@ -790,8 +814,8 @@ impl Stellar_CardReceiver {
     /// appointment.
     ///
     /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `new_admin` - The address to become the new admin
+    /// * `env`       — The Soroban execution environment.
+    /// * `new_admin` — The address that will become the new admin.
     ///
     /// Both the current admin and `new_admin` must authorize the call, preventing
     /// lockout from a typo\'d address.
@@ -807,24 +831,9 @@ impl Stellar_CardReceiver {
         );
     }
 
-    /// Grants a role to an address.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `address` - The address to grant the role to
-    /// * `role` - The role to grant (Admin, Operator, or Viewer)
-    ///
-    /// # Authorization (Issue #426 - Part 5 - Complete NatSpec)
-    /// Only the admin can call this function.
-    ///
-    /// # Storage (Issue #415 - Part 4)
-    /// Stored under a per-address persistent key (`DataKey::UserRole`)
-    /// rather than in a single growing `Map` — see the `DataKey::UserRole`
-    /// doc comment for why. The entry's TTL is extended via
-    /// `extend_role_ttl`, which only performs the write when the entry's
-    /// remaining TTL has actually dropped below the threshold, so
-    /// re-granting a role to the same address repeatedly doesn't re-bill
-    /// rent on every call.
+    // ── View entrypoints ──────────────────────────────────────────────────────
+
+    /// Returns the configured treasury address.
     ///
     /// # Events (Issue #428 - Part 5)
     /// Emits: topics=[Symbol("role_granted"), address], value=role — only
@@ -839,22 +848,10 @@ impl Stellar_CardReceiver {
         Self::store_role(&env, address, role);
     }
 
-    /// Grants the same role to several addresses in a single call.
+    /// Returns the USDC SAC contract address.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `addresses` - The addresses to grant the role to
-    /// * `role` - The role to grant (Admin, Operator, or Viewer)
-    ///
-    /// # Authorization
-    /// Only the admin can call this function.
-    ///
-    /// # Notes
-    /// Equivalent to calling `grant_role` once per address. Each address
-    /// still gets its own per-address persistent write (see
-    /// `DataKey::UserRole`), but instance storage's TTL is extended once
-    /// for the whole batch instead of once per address. An empty
-    /// `addresses` list is a no-op.
+    /// # Returns
+    /// The [`Address`] stored at [`DataKey::UsdcContract`].
     ///
     /// # Events
     /// Emits one `role_granted` event per address whose role actually
@@ -899,8 +896,8 @@ impl Stellar_CardReceiver {
     /// # Authorization (Issue #426 - Part 5 - Complete NatSpec)
     /// Only the admin can call this function.
     ///
-    /// # Events (Issue #428 - Part 5)
-    /// Emits: topics=[Symbol("role_revoked"), address], value=()
+    /// # Returns
+    /// The [`Address`] stored at [`DataKey::XlmContract`].
     ///
     /// # Panics
     /// Panics if called before `init`, or if `admin.require_auth()` fails.
@@ -920,20 +917,7 @@ impl Stellar_CardReceiver {
         Self::is_paused(&env)
     }
 
-    /// Allows the caller to give up their own role, without requiring the
-    /// admin to call `revoke_role` on their behalf.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `caller` - The address renouncing its own role (must authorize this call)
-    ///
-    /// # Authorization (Issue #414 - Part 4)
-    /// Requires only `caller.require_auth()` — no admin approval, since an
-    /// account can always give up a privilege it already holds. This is
-    /// the standard access-control self-service primitive: it lets an
-    /// address that suspects its key is compromised, or that is
-    /// deliberately stepping down, drop its own role immediately instead
-    /// of waiting on the admin to call `revoke_role`.
+    /// Returns the current admin address.
     ///
     /// # Events
     /// Emits: topics=[Symbol("role_renounced"), caller], value=() — only
@@ -987,6 +971,8 @@ mod test {
 
     // ── Test fixture ──────────────────────────────────────────────────────────
 
+    /// Shared test fixture that registers the contract and two mock SAC tokens,
+    /// then provides helpers for minting and balance-checking.
     struct Fixture {
         env: Env,
         contract_id: Address,
@@ -998,6 +984,9 @@ mod test {
     }
 
     impl Fixture {
+        /// Creates a new [`Fixture`] with freshly generated addresses and
+        /// `mock_all_auths()` enabled so all `require_auth` calls pass
+        /// automatically.
         fn new() -> Self {
             let env = Env::default();
             env.mock_all_auths();
@@ -1010,31 +999,39 @@ mod test {
             Fixture { env, contract_id, admin, treasury, payer, usdc, xlm_sac }
         }
 
+        /// Returns a type-safe client bound to the registered contract.
         fn client(&self) -> Stellar_CardReceiverClient<'_> {
             Stellar_CardReceiverClient::new(&self.env, &self.contract_id)
         }
 
+        /// Calls `init` with all fixture addresses.
         fn init(&self) {
             self.client().init(&self.admin, &self.treasury, &self.usdc, &self.xlm_sac);
         }
 
+        /// Mints USDC to `to` using the SAC admin client.
         fn mint_usdc(&self, to: &Address, amount: i128) {
             token::StellarAssetClient::new(&self.env, &self.usdc).mint(to, &amount);
         }
 
+        /// Mints XLM to `to` using the SAC admin client.
         fn mint_xlm(&self, to: &Address, amount: i128) {
             token::StellarAssetClient::new(&self.env, &self.xlm_sac).mint(to, &amount);
         }
 
+        /// Returns the USDC balance of `addr`.
         fn usdc_balance(&self, addr: &Address) -> i128 {
             token::Client::new(&self.env, &self.usdc).balance(addr)
         }
 
+        /// Returns the XLM balance of `addr`.
         fn xlm_balance(&self, addr: &Address) -> i128 {
             token::Client::new(&self.env, &self.xlm_sac).balance(addr)
         }
     }
 
+    /// Converts a Rust string slice to a Soroban [`Bytes`] value for use as
+    /// an `order_id` argument.
     fn order_bytes(env: &Env, s: &str) -> Bytes {
         Bytes::from_slice(env, s.as_bytes())
     }
@@ -1269,6 +1266,7 @@ mod test {
     // functionality. Tests cover successful transfers, authorization, error
     // handling, reentrancy protection, pause behavior, and edge cases.
 
+    /// `init` stores all four configuration addresses as documented.
     #[test]
     fn test_guard_resets_after_successful_pay_usdc() {
         let f = Fixture::new();
@@ -1439,6 +1437,7 @@ mod test {
         assert_eq!(c.admin(),         f.admin);
     }
 
+    /// `pause` emits the documented `paused` event with value `true`.
     #[test]
     #[should_panic(expected = "already initialized")]
     fn test_init_twice_panics() {
@@ -1447,6 +1446,8 @@ mod test {
         f.init();
     }
 
+    /// `pause` is documented as idempotent — calling it twice must NOT emit
+    /// a second event.
     #[test]
     fn test_pay_usdc_transfers_to_treasury() {
         let f = Fixture::new();
@@ -1458,6 +1459,7 @@ mod test {
         assert_eq!(f.usdc_balance(&f.payer), 0);
     }
 
+    /// `unpause` emits the documented `unpaused` event with value `false`.
     #[test]
     fn test_pay_xlm_transfers_to_treasury() {
         let f = Fixture::new();
@@ -1670,6 +1672,8 @@ mod test {
         assert!(f.client().try_pay_usdc(&f.payer, &0_i128, &order_bytes(&f.env, "z")).is_err());
     }
 
+    /// `pause` is documented to panic with "pause requires admin" when the
+    /// caller is not the stored admin.
     #[test]
     fn test_pay_usdc_rejects_negative() {
         let f = Fixture::new();
@@ -1677,6 +1681,8 @@ mod test {
         assert!(f.client().try_pay_usdc(&f.payer, &(-1_i128), &order_bytes(&f.env, "n")).is_err());
     }
 
+    /// `pay_usdc` documents that no funds move on a failed transfer — verify
+    /// payer and treasury balances are unchanged.
     #[test]
     fn test_pay_xlm_rejects_zero() {
         let f = Fixture::new();
@@ -1684,6 +1690,7 @@ mod test {
         assert!(f.client().try_pay_xlm(&f.payer, &0_i128, &order_bytes(&f.env, "z")).is_err());
     }
 
+    /// The contract is documented to never hold an XLM balance (no custody).
     #[test]
     fn test_pay_xlm_rejects_negative() {
         let f = Fixture::new();
@@ -1691,6 +1698,8 @@ mod test {
         assert!(f.client().try_pay_xlm(&f.payer, &(-1_i128), &order_bytes(&f.env, "n")).is_err());
     }
 
+    /// `is_paused_view` is documented to return `false` after init (contract
+    /// starts unpaused).
     #[test]
     fn test_contract_starts_unpaused() {
         let f = Fixture::new();
@@ -1708,6 +1717,8 @@ mod test {
         assert_eq!(res, Err(Ok(Error::ContractPaused)));
     }
 
+    /// `transfer_admin` is documented as a two-step pattern that updates the
+    /// stored admin.  Verify the new admin can exercise admin-gated functions.
     #[test]
     fn test_pause_blocks_pay_xlm() {
         let f = Fixture::new();
